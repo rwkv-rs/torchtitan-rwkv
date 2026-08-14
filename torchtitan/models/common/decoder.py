@@ -354,6 +354,7 @@ class Decoder(BaseModel):
         *,
         parallel_dims: ParallelDims,
         parallelism: ParallelismConfig,
+        max_num_documents: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         """Build masks (flex/varlen), CP-shard, SPMD-wrap, and return the batch."""
         # Function-local import avoids a circular import
@@ -367,7 +368,10 @@ class Decoder(BaseModel):
         if positions is not None:
             inner = self.config.first_full_attention_backend
             if isinstance(inner, (FlexAttention.Config, VarlenAttention.Config)):
-                batch["attention_masks"] = self.get_attention_masks(positions=positions)
+                batch["attention_masks"] = self.get_attention_masks(
+                    positions=positions,
+                    max_num_documents=max_num_documents,
+                )
 
         input_sharding = decoder_input_sharding()
         if parallel_dims.cp_enabled:
@@ -388,6 +392,8 @@ class Decoder(BaseModel):
     def get_attention_masks(
         self,
         positions: torch.Tensor,
+        *,
+        max_num_documents: int | None = None,
     ) -> AttentionMasksType | None:
         attn_config = self.config.first_attention
         if attn_config is None:
@@ -398,7 +404,15 @@ class Decoder(BaseModel):
         if isinstance(inner_attn, FlexAttention.Config):
             return self._create_flex_attention_mask_for_document(positions, attn_config)
         elif isinstance(inner_attn, VarlenAttention.Config):
-            return create_varlen_metadata_for_document(positions)
+            return create_varlen_metadata_for_document(
+                positions,
+                max_num_documents=max_num_documents,
+                max_context_length=(
+                    self.config.max_context_length
+                    if max_num_documents is not None
+                    else None
+                ),
+            )
         else:
             raise TypeError(
                 f"Only VarlenAttention and FlexAttention support attention masks, "

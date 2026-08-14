@@ -48,6 +48,8 @@ class TextCollator(Collator):
     def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
         del config
         self._num_tokens_per_batch = context.num_tokens_per_batch
+        self._max_context_length = context.max_context_length
+        self._max_num_documents = context.max_num_documents
 
     def __call__(self, rows: Sequence[TextSequence]) -> TrainerBatch:
         num_tokens = sum(len(row.input_ids) for row in rows)
@@ -73,7 +75,58 @@ class TextCollator(Collator):
                 [positions, torch.zeros(pad_len, dtype=positions.dtype)]
             )
 
+        if self._max_num_documents is not None:
+            input_ids, labels, positions = _cap_document_count(
+                input_ids,
+                labels,
+                positions,
+                max_num_documents=self._max_num_documents,
+                max_context_length=self._max_context_length,
+            )
+
         return {
             "input": input_ids,
             "positions": positions,
         }, labels
+
+
+def _cap_document_count(
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    max_num_documents: int,
+    max_context_length: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Replace excess document suffixes with context-sized padding segments."""
+    document_starts = (positions == 0).nonzero(as_tuple=True)[0]
+    if document_starts.numel() <= max_num_documents:
+        return input_ids, labels, positions
+
+    num_tokens = positions.numel()
+    cutoff = 0
+    for num_kept_documents in range(max_num_documents, -1, -1):
+        candidate_cutoff = (
+            num_tokens
+            if num_kept_documents == document_starts.numel()
+            else int(document_starts[num_kept_documents])
+        )
+        num_padding_documents = (
+            num_tokens - candidate_cutoff + max_context_length - 1
+        ) // max_context_length
+        if num_kept_documents + num_padding_documents <= max_num_documents:
+            cutoff = candidate_cutoff
+            break
+
+    input_ids = input_ids.clone()
+    labels = labels.clone()
+    positions = positions.clone()
+    input_ids[cutoff:] = 0
+    labels[cutoff:] = IGNORE_INDEX
+    positions[cutoff:] = (
+        torch.arange(
+            num_tokens - cutoff, dtype=positions.dtype, device=positions.device
+        )
+        % max_context_length
+    )
+    return input_ids, labels, positions

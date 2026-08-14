@@ -48,7 +48,7 @@ from torchtitan.distributed.cudagraph import (
     ForwardBackwardFn,
     wrap_with_cuda_graph,
 )
-from torchtitan.models.common.attention import FlexAttention
+from torchtitan.models.common.attention import FlexAttention, VarlenAttention
 from torchtitan.models.common.token_dispatcher import (
     HybridEPTokenDispatcher,
     LocalTokenDispatcher,
@@ -124,7 +124,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     "parallelism.num_pp_microbatches must be greater than 0."
                 )
 
-            self._validate_cuda_graphs()
+            self._validate_cuda_graphs(check_varlen_metadata=False)
 
             if (
                 self.parallelism.spmd_backend == "spmd_types"
@@ -162,7 +162,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     "--compile.components."
                 )
 
-        def _validate_cuda_graphs(self) -> None:
+        def _validate_cuda_graphs(self, *, check_varlen_metadata: bool = True) -> None:
             if self.training.disable_cuda_graphs:
                 return
 
@@ -172,7 +172,25 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
                     "Set --training.disable_cuda_graphs."
                 )
 
-            if self.parallelism.expert_parallel_degree == 1 or self.model_spec is None:
+            if self.model_spec is None:
+                assert not check_varlen_metadata
+                return
+
+            if check_varlen_metadata:
+                max_num_documents = getattr(self.dataloader, "max_num_documents", None)
+                for fqn, _, _, _ in self.model_spec.model.traverse(
+                    VarlenAttention.Config
+                ):
+                    if max_num_documents is None:
+                        raise ValueError(
+                            "CUDA graphs require fixed-shape varlen document "
+                            f"metadata for {fqn}, but "
+                            "dataloader.max_num_documents is unset. Set it to "
+                            "an upper bound on documents per local token batch, "
+                            "or set --training.disable_cuda_graphs."
+                        )
+
+            if self.parallelism.expert_parallel_degree == 1:
                 return
 
             for _, dispatcher_config, _, _ in self.model_spec.model.traverse(
@@ -688,12 +706,25 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         assert isinstance(input_dict, dict)
         assert isinstance(labels, torch.Tensor)
         with sl.log_trace_span("preprocess_inputs"):
+            preprocess_kwargs = {
+                "parallel_dims": self.parallel_dims,
+                "parallelism": self.config.parallelism,
+            }
+            max_num_documents = getattr(
+                getattr(self.config, "dataloader", None),
+                "max_num_documents",
+                None,
+            )
+            if (
+                max_num_documents is not None
+                and not self.config.training.disable_cuda_graphs
+            ):
+                preprocess_kwargs["max_num_documents"] = max_num_documents
             inputs, labels, extra_kwargs = cast(
                 BaseModel, self.model_parts[0]
             ).preprocess_inputs(
                 {**input_dict, "labels": labels},
-                parallel_dims=self.parallel_dims,
-                parallelism=self.config.parallelism,
+                **preprocess_kwargs,
             )
             self.ntokens_seen += labels.numel()
 
@@ -739,12 +770,25 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         target_mbs: list[torch.Tensor] | None = [] if self.pp_has_last_stage else None
         for input_dict, labels in zip(input_dict_mbs, label_mbs, strict=True):
             with sl.log_trace_span("preprocess_inputs"):
+                preprocess_kwargs = {
+                    "parallel_dims": self.parallel_dims,
+                    "parallelism": self.config.parallelism,
+                }
+                max_num_documents = getattr(
+                    getattr(self.config, "dataloader", None),
+                    "max_num_documents",
+                    None,
+                )
+                if (
+                    max_num_documents is not None
+                    and not self.config.training.disable_cuda_graphs
+                ):
+                    preprocess_kwargs["max_num_documents"] = max_num_documents
                 inputs, labels, extra_kwargs = cast(
                     BaseModel, self.model_parts[0]
                 ).preprocess_inputs(
                     {**input_dict, "labels": labels},
-                    parallel_dims=self.parallel_dims,
-                    parallelism=self.config.parallelism,
+                    **preprocess_kwargs,
                 )
                 self.ntokens_seen += labels.numel()
             if self.pp_has_first_stage:

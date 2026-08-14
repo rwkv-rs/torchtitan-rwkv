@@ -6,10 +6,15 @@
 
 import os
 import unittest
+from types import SimpleNamespace
 
+import numpy as np
 import torch
 
 from torchtitan.components.data import ConcatThenSplitPackingConfig, GrainDataLoader
+from torchtitan.components.data.collators import TextCollator
+from torchtitan.components.data.dataset import TextSequence
+from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.hf_datasets.text_datasets import DATASETS
 
@@ -84,6 +89,33 @@ class TestTextDatasetPacking(unittest.TestCase):
 
         # Guard against the assertions above passing vacuously.
         self.assertGreater(interior_doc_starts, 0)
+
+    def test_document_cap_pads_with_context_sized_segments(self):
+        collator = TextCollator.Config().build(
+            context=SimpleNamespace(
+                num_tokens_per_batch=12,
+                max_context_length=4,
+                max_num_documents=4,
+            )
+        )
+        row = TextSequence(
+            input_ids=np.arange(12),
+            labels=np.arange(12),
+            positions=np.asarray([0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1]),
+        )
+
+        input_dict, labels = collator([row])
+        input_ids = input_dict["input"]
+        positions = input_dict["positions"]
+
+        document_starts = (positions == 0).nonzero(as_tuple=True)[0]
+        self.assertEqual(document_starts.tolist(), [0, 2, 4, 8])
+        boundaries = torch.cat([document_starts, torch.tensor([positions.numel()])])
+        self.assertLessEqual(int(torch.diff(boundaries).max()), 4)
+        torch.testing.assert_close(input_ids[4:], torch.zeros(8, dtype=torch.int64))
+        torch.testing.assert_close(
+            labels[4:], torch.full((8,), IGNORE_INDEX, dtype=torch.int64)
+        )
 
 
 class TestTextDatasetBufferCheckpointing(unittest.TestCase):

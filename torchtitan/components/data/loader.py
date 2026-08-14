@@ -71,6 +71,12 @@ class GrainDataLoader(BaseDataLoader):
         """Concurrent indexed reads used when a `MapDataset` becomes an `IterDataset`."""
         num_prefetch_batches: Annotated[int, tyro.conf.Suppress] = 2
         """Collated batches queued per rank for trainer consumption."""
+        max_num_documents: Annotated[int | None, tyro.conf.Suppress] = None
+        """Maximum document segments in one local token batch."""
+
+        def __post_init__(self) -> None:
+            if self.max_num_documents is not None and self.max_num_documents <= 0:
+                raise ValueError("max_num_documents must be positive")
 
     def __init__(
         self,
@@ -105,7 +111,20 @@ class GrainDataLoader(BaseDataLoader):
             max_context_length=max_context_length,
             num_tokens_per_batch=num_tokens_per_batch,
             read_options=read_options,
+            max_num_documents=config.max_num_documents,
         )
+        min_num_documents = (
+            num_tokens_per_batch + max_context_length - 1
+        ) // max_context_length
+        if (
+            config.max_num_documents is not None
+            and config.max_num_documents < min_num_documents
+        ):
+            raise ValueError(
+                "max_num_documents must be at least "
+                f"ceil(num_tokens_per_batch / max_context_length) "
+                f"({min_num_documents}), got {config.max_num_documents}"
+            )
         dataset_iteration_policy = DatasetIterationPolicy(
             seed=config.seed,
             shuffle=config.shuffle,

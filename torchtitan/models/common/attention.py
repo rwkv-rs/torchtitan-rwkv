@@ -592,6 +592,8 @@ def create_varlen_metadata_for_document(
     positions: torch.Tensor,
     *,
     include_host_offsets: bool = False,
+    max_num_documents: int | None = None,
+    max_context_length: int | None = None,
 ) -> VarlenMetadata:
     """Creates cumulative sequence length indices needed for variable length attention.
 
@@ -603,6 +605,12 @@ def create_varlen_metadata_for_document(
             reset to 0 at each document start.
         include_host_offsets: Also materialize cumulative sequence offsets as
             host metadata for kernels that need it.
+        max_num_documents: Upper bound on packed documents in the local token
+            batch. When set, the device offsets have a fixed shape as required
+            for CUDA graph capture.
+        max_context_length: Maximum length of one document segment. Required
+            with ``max_num_documents`` so the fixed-shape metadata can avoid a
+            device-to-host synchronization.
 
     Returns:
         VarlenMetadata containing cumulative sequence length indices for q, k,
@@ -610,42 +618,73 @@ def create_varlen_metadata_for_document(
     """
     num_tokens = positions.shape[0]
     device = positions.device
-    doc_starts = (positions == 0).nonzero(as_tuple=True)[0].to(torch.int32)
-    packed_cu_seqlens = torch.cat(
-        [
-            doc_starts,
-            torch.tensor([num_tokens], dtype=torch.int32, device=device),
-        ]
-    )
+    packed_cu_seqlens_host = None
+
+    if max_num_documents is not None:
+        if max_context_length is None:
+            raise ValueError(
+                "max_context_length is required when max_num_documents is set"
+            )
+
+        num_slots = max_num_documents + 1
+        is_doc_start = positions == 0
+        slot = torch.cumsum(is_doc_start, 0) - 1
+        scatter_index = torch.where(
+            is_doc_start & (slot < max_num_documents),
+            slot,
+            torch.full_like(slot, num_slots),
+        )
+        packed_cu_seqlens = torch.full(
+            (num_slots + 1,), num_tokens, dtype=torch.int32, device=device
+        )
+        packed_cu_seqlens.scatter_(
+            0,
+            scatter_index,
+            torch.arange(num_tokens, dtype=torch.int32, device=device),
+        )
+        torch._assert_async(is_doc_start.sum() <= max_num_documents)
+        packed_cu_seqlens = packed_cu_seqlens[:num_slots]
+        max_seqlen = max_context_length
+
+        if include_host_offsets:
+            packed_cu_seqlens_host = tuple(
+                int(offset) for offset in packed_cu_seqlens.tolist()
+            )
+    else:
+        doc_starts = (positions == 0).nonzero(as_tuple=True)[0].to(torch.int32)
+        packed_cu_seqlens = torch.cat(
+            [
+                doc_starts,
+                torch.tensor([num_tokens], dtype=torch.int32, device=device),
+            ]
+        )
+        seq_lengths = torch.diff(packed_cu_seqlens)
+
+        if include_host_offsets:
+            packed_cu_seqlens_host = tuple(
+                int(offset) for offset in packed_cu_seqlens.tolist()
+            )
+            max_seqlen = max(
+                (
+                    end - start
+                    for start, end in zip(
+                        packed_cu_seqlens_host[:-1],
+                        packed_cu_seqlens_host[1:],
+                        strict=False,
+                    )
+                ),
+                default=0,
+            )
+        elif seq_lengths.numel() > 0:
+            # device to host sync but only done once per model forward
+            max_seqlen = int(seq_lengths.max().item())
+        else:
+            max_seqlen = 0
+
     if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
         # Packed document boundaries are rank-local ragged metadata, so they
         # vary across DP ranks even when construction initially infers R.
         spmd.mutate_type(packed_cu_seqlens, "dp", src=spmd.R, dst=spmd.V)
-    seq_lengths = torch.diff(packed_cu_seqlens)
-
-    max_seqlen: int
-    packed_cu_seqlens_host = None
-    if include_host_offsets:
-        packed_cu_seqlens_host = tuple(
-            int(offset) for offset in packed_cu_seqlens.tolist()
-        )
-        max_seqlen = max(
-            (
-                end - start
-                for start, end in zip(
-                    packed_cu_seqlens_host[:-1],
-                    packed_cu_seqlens_host[1:],
-                    strict=False,
-                )
-            ),
-            default=0,
-        )
-    elif seq_lengths.numel() > 0:
-        # device to host sync but only done once per model forward
-        max_seqlen = int(seq_lengths.max().item())
-    else:
-        max_seqlen = 0
-
     return VarlenMetadata(
         cu_seq_q=packed_cu_seqlens,
         cu_seq_k=packed_cu_seqlens,
