@@ -5,7 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import sys
-from collections.abc import Generator, Sequence
+from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -24,9 +24,38 @@ from torch.distributed.tensor._dtensor_spec import DTensorSpec
 from torch.distributed.tensor._redistribute import redistribute_local_tensor
 from torch.distributed.tensor.placement_types import _StridedShard, Placement
 
+from torchtitan.components.quantization._fsdp_weight import build_compute_weight
 from torchtitan.protocols.module import Module
 
 _active_parametrization = True
+
+
+class ComputeWeightParametrization(nn.Module):
+    """Derive a compute weight from the unsharded parameter, if it has one.
+
+    Composes around a data-parallel parametrization rather than chaining after
+    it. The representation to build is determined by the tensor subclass on
+    the *sharded* parameter, and ReplicateComputation returns a plain local
+    tensor, so that subclass is unreachable from its output -- this wrapper
+    still sees the original parameter and passes both along.
+
+    Parameters with no compute representation pass through, so this can be
+    applied unconditionally.
+
+    Used by passing the class itself as ``data_parallel``'s
+    ``parametrization_transform``, which wraps it around the data-parallel
+    parametrization before registering. The alternative was to do this inline
+    in ``ReplicateComputation.forward``, which is simpler but puts quantization
+    knowledge in the data-parallel core; going through the transform keeps that
+    file free of it.
+    """
+
+    def __init__(self, inner: nn.Module) -> None:
+        super().__init__()
+        self.inner = inner
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return build_compute_weight(self.inner(x), x)
 
 
 @contextmanager
@@ -246,8 +275,7 @@ class ReplicateComputation(Module):
         if not _active_parametrization:
             return x
 
-        output = self.replicate_compute(x)
-        return output
+        return self.replicate_compute(x)
 
 
 def data_parallel(
@@ -256,7 +284,17 @@ def data_parallel(
     mode: str = "replicate",
     mp_policy: MixedPrecisionPolicy | None = None,
     shard_dim: int = 0,
+    parametrization_transform: Callable[[nn.Module], nn.Module] | None = None,
 ) -> nn.Module:
+    """Shard ``model`` and install the data-parallel parametrization.
+
+    ``parametrization_transform`` composes an outer parametrization around the
+    data-parallel one, letting a caller derive something from the unsharded
+    weight without this module knowing what. It receives the original
+    parameter, which the data-parallel stage does not preserve: the stage
+    returns a plain local tensor, so any tensor subclass on the sharded
+    parameter is no longer reachable from its output.
+    """
     param_sharding: tuple[Placement, ...]
     if mode == "replicate":
         param_sharding = (Replicate(),)
@@ -306,14 +344,18 @@ def data_parallel(
                 #     unsafe=True,
                 # )
 
+        parametrization: nn.Module = ReplicateComputation(
+            device_mesh,
+            param_sharding,
+            mode,
+            mp_policy=mp_policy,
+        )
+        if parametrization_transform is not None:
+            parametrization = parametrization_transform(parametrization)
+
         _register_parametrization(
             mod,
             list(params_dict.keys()),
-            ReplicateComputation(
-                device_mesh,
-                param_sharding,
-                mode,
-                mp_policy=mp_policy,
-            ),
+            parametrization,
         )
     return model

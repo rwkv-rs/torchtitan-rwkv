@@ -20,6 +20,7 @@ from torch.utils._pytree import register_constant, register_pytree_node, tree_ma
 from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.experiments.graph_trainer.simple_fsdp import (
+    ComputeWeightParametrization,
     data_parallel,
     MixedPrecisionPolicy,
 )
@@ -501,6 +502,7 @@ def apply_simple_fsdp(
                 dp_mode,
                 mp_policy=mp_policy,
                 shard_dim=experts_shard_dim,
+                parametrization_transform=ComputeWeightParametrization,
             )
 
     model = data_parallel(
@@ -508,6 +510,7 @@ def apply_simple_fsdp(
         dp_mesh,
         dp_mode,
         mp_policy=mp_policy,
+        parametrization_transform=ComputeWeightParametrization,
     )
     logger.info(
         "Applied Data Parallel (simple_fsdp) (dp mode=%s) to the model", dp_mode

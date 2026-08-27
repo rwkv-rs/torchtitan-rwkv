@@ -6,7 +6,6 @@
 
 import pytest
 import torch
-from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 
@@ -14,13 +13,12 @@ pytest.importorskip("torchao")
 pytest.importorskip("torchao.prototype.moe_training.kernels.mxfp8")
 
 import torchtitan.components.quantization.mxfp8.linear as mxfp8_linear  # noqa: E402
-from torchtitan.components.quantization.mxfp8.linear import MXFP8Linear  # noqa: E402
-from torchtitan.components.quantization.mxfp8.quantize import (  # noqa: E402
-    quantize_mxfp8_weight,
+from torchtitan.components.quantization._fsdp_weight import (  # noqa: E402
+    _ComputeFSDPWeight,
 )
+from torchtitan.components.quantization.mxfp8.linear import MXFP8Linear  # noqa: E402
 from torchtitan.components.quantization.mxfp8.tensor import (  # noqa: E402
-    MXFP8FSDPComputeWeight,
-    MXFP8FSDPWeight,
+    _LinearShardedWeightWithMXFP8Compute,
 )
 
 
@@ -38,14 +36,14 @@ def _make_mxfp8_linear(
     out_features: int = 96,
     *,
     bias: bool = True,
-    input_activation_save_format: str = "bf16",
+    input_activation_format_for_backward: str = "bf16",
 ) -> MXFP8Linear:
     return (
         MXFP8Linear.Config(
             in_features=in_features,
             out_features=out_features,
             bias=bias,
-            input_activation_save_format=input_activation_save_format,
+            input_activation_format_for_backward=input_activation_format_for_backward,
         )
         .build()
         .cuda()
@@ -53,12 +51,12 @@ def _make_mxfp8_linear(
     )
 
 
-@pytest.mark.parametrize("input_activation_save_format", ["bf16", "mxfp8"])
+@pytest.mark.parametrize("input_activation_format_for_backward", ["bf16", "mxfp8"])
 def test_mxfp8_linear_saves_selected_input_activation(
-    input_activation_save_format,
+    input_activation_format_for_backward,
 ):
     linear = _make_mxfp8_linear(
-        input_activation_save_format=input_activation_save_format,
+        input_activation_format_for_backward=input_activation_format_for_backward,
     )
     x = torch.randn(
         37,
@@ -79,7 +77,7 @@ def test_mxfp8_linear_saves_selected_input_activation(
         output.backward(torch.randn_like(output))
 
     assert output.shape == (37, linear.out_features)
-    if input_activation_save_format == "bf16":
+    if input_activation_format_for_backward == "bf16":
         assert len(saved_tensors) == 3
         assert saved_tensors[0].dtype == torch.bfloat16
         assert saved_tensors[0].untyped_storage()._cdata == x.untyped_storage()._cdata
@@ -95,19 +93,18 @@ def test_mxfp8_linear_saves_selected_input_activation(
             sum(tensor.dtype == torch.float8_e8m0fnu for tensor in saved_tensors) == 2
         )
     assert all(type(tensor) is torch.Tensor for tensor in saved_tensors)
-    assert isinstance(linear.weight, MXFP8FSDPWeight)
 
 
 @pytest.mark.parametrize(
-    ("input_activation_save_format", "expected_quantize_calls"),
+    ("input_activation_format_for_backward", "expected_quantize_calls"),
     [
         ("bf16", [(True, False), (True, True), (False, True)]),
         ("mxfp8", [(True, True), (True, True)]),
     ],
 )
-def test_mxfp8_input_activation_save_format_controls_quantization_work(
+def test_mxfp8_input_activation_format_for_backward_controls_quantization_work(
     monkeypatch,
-    input_activation_save_format,
+    input_activation_format_for_backward,
     expected_quantize_calls,
 ):
     original_quantize = mxfp8_linear.mxfp8_quantize_cuda
@@ -120,7 +117,7 @@ def test_mxfp8_input_activation_save_format_controls_quantization_work(
     monkeypatch.setattr(mxfp8_linear, "mxfp8_quantize_cuda", record_quantize)
     linear = _make_mxfp8_linear(
         bias=False,
-        input_activation_save_format=input_activation_save_format,
+        input_activation_format_for_backward=input_activation_format_for_backward,
     )
     x = torch.randn(
         64,
@@ -142,42 +139,79 @@ def test_mxfp8_square_weight_dgrad_qdata_is_transpose_view():
         device="cuda",
         dtype=torch.bfloat16,
     )
-    operands = quantize_mxfp8_weight(weight_NK)
-    compute_weight = MXFP8FSDPComputeWeight(
-        operands,
-        logical_shape=weight_NK.shape,
-        logical_stride=weight_NK.stride(),
-        logical_storage_offset=int(weight_NK.storage_offset()),
-        orig_dtype=weight_NK.dtype,
-    )
+    compute_weight = _LinearShardedWeightWithMXFP8Compute(
+        weight_NK
+    )._build_compute_weight(weight_NK)
+    operands = compute_weight.compute_representation
+    assert operands is not None
     inner_tensor_names, metadata = compute_weight.__tensor_flatten__()
-    rebuilt_compute_weight = MXFP8FSDPComputeWeight.__tensor_unflatten__(
+    rebuilt_compute_weight = type(compute_weight).__tensor_unflatten__(
         {name: getattr(compute_weight, name) for name in inner_tensor_names},
         metadata,
         compute_weight.shape,
         compute_weight.stride(),
     )
+    rebuilt_operands = rebuilt_compute_weight.compute_representation
+    assert rebuilt_operands is not None
 
-    q_weight_dgrad_NK = compute_weight.q_weight_dgrad_NK
-
+    # Inner tensors are named after the representation's dataclass fields.
+    # The FPROP qdata is a property, not a field, so FSDP does not manage it.
     assert inner_tensor_names == [
-        "q_weight_fprop_KN",
-        "s_weight_fprop_blocked",
-        "s_weight_dgrad_blocked",
+        "_q_weight_dgrad_NK",
+        "_s_weight_fprop_blocked",
+        "_s_weight_dgrad_blocked",
     ]
-    assert len(compute_weight.fsdp_managed_tensors()) == 3
-    assert len(rebuilt_compute_weight.fsdp_managed_tensors()) == 3
-    assert q_weight_dgrad_NK.data_ptr() == operands.q_weight_fprop_KN.data_ptr()
-    assert torch.equal(q_weight_dgrad_NK, operands.q_weight_fprop_KN.t())
     assert (
-        rebuilt_compute_weight.q_weight_dgrad_NK.data_ptr()
-        == rebuilt_compute_weight.q_weight_fprop_KN.data_ptr()
+        operands.q_weight_dgrad_NK.data_ptr() == operands.q_weight_fprop_KN.data_ptr()
+    )
+    assert torch.equal(
+        operands.q_weight_dgrad_NK,
+        operands.q_weight_fprop_KN.t(),
+    )
+    assert (
+        rebuilt_operands.q_weight_dgrad_NK.data_ptr()
+        == rebuilt_operands.q_weight_fprop_KN.data_ptr()
     )
 
 
-def test_mxfp8_linear_supports_plain_bf16_weight():
+def test_compute_representation_fields_must_be_distinct_allocations():
+    """FSDP owns each field's storage, so a field may not alias another.
+
+    Derived views belong in properties, as ``_MXFP8LinearOperands`` does for
+    its FPROP qdata. A format that made one a field instead would have FSDP
+    free the same storage twice.
+    """
+    from dataclasses import dataclass
+
+    from torchtitan.components.quantization._fsdp_weight import _representation_tensors
+
+    qdata = torch.empty(64, 64, device="cuda", dtype=torch.float8_e4m3fn)
+
+    @dataclass(frozen=True)
+    class AliasingOperands:
+        qdata_dgrad: torch.Tensor
+        qdata_fprop: torch.Tensor
+
+    with pytest.raises(ValueError, match="distinct allocations"):
+        _representation_tensors(AliasingOperands(qdata, qdata.t()))
+
+    @dataclass(frozen=True)
+    class DistinctOperands:
+        qdata_dgrad: torch.Tensor
+        scale: torch.Tensor
+
+    scale = torch.empty(64, 2, device="cuda", dtype=torch.float8_e8m0fnu)
+    assert len(_representation_tensors(DistinctOperands(qdata, scale))) == 2
+
+
+def test_mxfp8_linear_quantizes_per_call_without_fsdp():
     linear = _make_mxfp8_linear()
-    linear.weight = nn.Parameter(linear.weight._data.detach().clone())
+    # The wrapper is installed at construction, but with no data parallel
+    # implementation driving its lifecycle it holds only the BF16 weight, so
+    # forward builds the operands per call and backward saves them directly.
+    # The sharded state is the type, so there is no representation to inspect.
+    assert isinstance(linear.weight, _LinearShardedWeightWithMXFP8Compute)
+    assert not isinstance(linear.weight, _ComputeFSDPWeight)
     x = torch.randn(
         32,
         linear.in_features,
@@ -191,14 +225,18 @@ def test_mxfp8_linear_supports_plain_bf16_weight():
 
     assert output.shape == (32, linear.out_features)
     assert x.grad is not None
+    # The gradient reaches the wrapped parameter in high precision.
     assert linear.weight.grad is not None
+    assert linear.weight.grad.dtype == torch.bfloat16
 
 
-@pytest.mark.parametrize("input_activation_save_format", ["bf16", "mxfp8"])
-def test_mxfp8_linear_compiles_forward_and_backward(input_activation_save_format):
+@pytest.mark.parametrize("input_activation_format_for_backward", ["bf16", "mxfp8"])
+def test_mxfp8_linear_compiles_forward_and_backward(
+    input_activation_format_for_backward,
+):
     linear = _make_mxfp8_linear(
         bias=False,
-        input_activation_save_format=input_activation_save_format,
+        input_activation_format_for_backward=input_activation_format_for_backward,
     )
     compiled_linear = torch.compile(linear, fullgraph=True)
     x = torch.randn(
@@ -218,11 +256,13 @@ def test_mxfp8_linear_compiles_forward_and_backward(input_activation_save_format
     assert type(linear.weight.grad) is torch.Tensor
 
 
-@pytest.mark.parametrize("input_activation_save_format", ["bf16", "mxfp8"])
-def test_mxfp8_linear_nonreentrant_checkpoint(input_activation_save_format):
+@pytest.mark.parametrize("input_activation_format_for_backward", ["bf16", "mxfp8"])
+def test_mxfp8_linear_nonreentrant_checkpoint(
+    input_activation_format_for_backward,
+):
     linear = _make_mxfp8_linear(
         bias=False,
-        input_activation_save_format=input_activation_save_format,
+        input_activation_format_for_backward=input_activation_format_for_backward,
     )
     x = torch.randn(
         64,
@@ -239,14 +279,14 @@ def test_mxfp8_linear_nonreentrant_checkpoint(input_activation_save_format):
     assert linear.weight.grad is not None
 
 
-def test_mxfp8_input_activation_save_formats_match():
+def test_mxfp8_input_activation_formats_for_backward_match():
     bf16 = _make_mxfp8_linear(
         bias=False,
-        input_activation_save_format="bf16",
+        input_activation_format_for_backward="bf16",
     )
     mxfp8 = _make_mxfp8_linear(
         bias=False,
-        input_activation_save_format="mxfp8",
+        input_activation_format_for_backward="mxfp8",
     )
     mxfp8.load_state_dict(bf16.state_dict())
 
