@@ -252,6 +252,7 @@ def build_inference_engine(config: Controller.Config) -> LLMEngine:
         enforce_eager=not gen_config.cudagraph.enable,
         hf_overrides={"architectures": [VLLM_MODEL_NAME]},
         attention_config=AttentionConfig(backend=backend_enum),
+        enable_flashinfer_autotune=False,
         disable_log_stats=True,
     )
 
@@ -632,16 +633,17 @@ class BitwiseParityTestBase(unittest.TestCase):
         if hf_path:
             config.hf_assets_path = hf_path
 
-        from torchtitan.tools.utils import has_cuda_capability
+        from torchtitan.tools.utils import get_cuda_flash_attention_impl
 
-        if has_cuda_capability(9, 0):
+        flash_attention_impl = get_cuda_flash_attention_impl()
+        if flash_attention_impl is not None:
             from torch.nn.attention import (
                 activate_flash_attention_impl,
                 current_flash_attention_impl,
             )
 
-            if current_flash_attention_impl() != "FA3":
-                activate_flash_attention_impl("FA3")
+            if current_flash_attention_impl() != flash_attention_impl:
+                activate_flash_attention_impl(flash_attention_impl)
 
         # Enable batch-invariant mode BEFORE init_distributed
         set_batch_invariance(config.trainer.debug.batch_invariant)

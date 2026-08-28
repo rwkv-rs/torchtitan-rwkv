@@ -12,6 +12,11 @@ from typing import Literal
 import spmd_types as spmd
 import torch
 import torch.nn.functional as F
+from attn_gym.linear import (
+    causal_conv1d as _attn_gym_causal_conv1d,
+    l2norm as _attn_gym_l2norm,
+    recurrent_gdn as _attn_gym_recurrent_gdn,
+)
 from fla.modules.conv.triton.ops import CausalConv1dFunction
 from fla.ops.gated_delta_rule import (
     chunk_gated_delta_rule as _fla_chunk_gated_delta_rule,
@@ -48,16 +53,26 @@ def _causal_conv1d_varlen(
     cu_seqlens: torch.Tensor,
     cu_seqlens_cpu: torch.Tensor | None,
 ) -> torch.Tensor:
-    """FLA depthwise causal conv with per-document resets (CUDA-only).
+    """Depthwise causal conv with per-document resets (CUDA-only).
 
     A pure-torch per-document reference lives in
     ``tests/unit_tests/gpu/test_qwen3_5_deltanet.py``.
     """
     if cu_seqlens_cpu is None:
         raise ValueError(
-            "Qwen3.5 FLA varlen conv requires a CPU cu_seqlens tensor. "
+            "Qwen3.5 varlen conv requires a CPU cu_seqlens tensor. "
             "Build VarlenMetadata with include_host_offsets=True."
         )
+
+    if is_in_batch_invariant_mode():
+        output = _attn_gym_causal_conv1d(
+            x_TD.unsqueeze(0),
+            weight.squeeze(1),
+            activation="silu",
+            cu_seqlens=cu_seqlens,
+        )
+        assert isinstance(output, torch.Tensor)
+        return output.squeeze(0)
 
     from fla.modules.conv.causal_conv1d import causal_conv1d as _fla_causal_conv1d
 
@@ -114,28 +129,45 @@ def _recurrent_gdn_fwd(
 ) -> torch.Tensor:
     """Run the batch-invariant GDN recurrent forward kernel.
 
-    The vLLM generator must use the recurrent kernel for per-token decode. The
-    trainer uses the same kernel with a materialized float32 initial state and
-    varlen metadata so its forward is bitwise identical to generation.
+    The vLLM generator uses Attention Gym's paging-aware recurrent kernel for
+    per-token decode. The trainer uses the same recurrence with a materialized
+    float32 initial state and varlen metadata so its forward is bitwise identical
+    to generation.
     """
     num_sequences = int(cu_seqlens.numel()) - 1
-    initial_state = q.new_zeros(
-        num_sequences,
+    state_cache = q.new_empty(
+        num_sequences + 1,
         q.shape[2],
-        q.shape[3],
         v.shape[3],
+        q.shape[3],
         dtype=torch.float32,
     )
-    output, _ = _fla_fused_recurrent_gated_delta_rule(
-        q,
-        k,
+    state_indices = torch.arange(
+        1,
+        num_sequences + 1,
+        dtype=torch.int32,
+        device=q.device,
+    )
+    has_initial_state = torch.zeros(
+        num_sequences,
+        dtype=torch.bool,
+        device=q.device,
+    )
+    normalized_q = _attn_gym_l2norm(q, cu_seqlens=cu_seqlens)
+    normalized_k = _attn_gym_l2norm(k, cu_seqlens=cu_seqlens)
+    output, _ = _attn_gym_recurrent_gdn(
+        normalized_q,
+        normalized_k,
         v,
         g,
-        beta=beta,
-        initial_state=initial_state,
-        output_final_state=True,
-        use_qk_l2norm_in_kernel=True,
+        beta,
+        state_cache,
         cu_seqlens=cu_seqlens,
+        scale=q.shape[-1] ** -0.5,
+        state_indices=state_indices,
+        has_initial_state=has_initial_state,
+        autotune=False,
+        impl="fused",
     )
     return output.to(q.dtype)
 

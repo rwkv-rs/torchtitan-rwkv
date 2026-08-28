@@ -10,6 +10,7 @@ from unittest import mock
 import torch
 import torch.nn.functional as F
 from torch import nn
+
 from torchtitan.models.common.attention import (
     create_varlen_metadata_for_document,
     VarlenMetadata,
@@ -599,6 +600,81 @@ class TestQwen35DeltaNetVarlen(unittest.TestCase):
         self._assert_fla_varlen_matches_per_document(
             "fla_fused_recurrent", atol=2e-2, rtol=2e-2
         )
+
+    def test_batch_invariant_recurrent_matches_paged_attention_gym(self):
+        if not torch.cuda.is_available():
+            raise unittest.SkipTest("CUDA is unavailable")
+
+        from attn_gym.linear import l2norm, recurrent_gdn
+
+        from torchtitan.models.qwen3_5.gdn import _recurrent_gdn_fwd
+
+        torch.manual_seed(42)
+        num_tokens, num_heads, key_dim, value_dim = 12, 4, 64, 64
+        q = torch.randn(
+            1,
+            num_tokens,
+            num_heads,
+            key_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).requires_grad_()
+        k = torch.randn_like(q).requires_grad_()
+        v = torch.randn(
+            1,
+            num_tokens,
+            num_heads,
+            value_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+        ).requires_grad_()
+        decay = (-torch.rand(1, num_tokens, num_heads, device="cuda")).requires_grad_()
+        update_gate = torch.rand(
+            1, num_tokens, num_heads, device="cuda", requires_grad=True
+        )
+        cu_seqlens = torch.tensor([0, 5, 12], device="cuda", dtype=torch.int32)
+
+        actual = _recurrent_gdn_fwd(
+            q,
+            k,
+            v,
+            decay,
+            update_gate,
+            cu_seqlens,
+            cu_seqlens.cpu(),
+        )
+
+        state_cache = torch.empty(
+            3,
+            num_heads,
+            value_dim,
+            key_dim,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        state_indices = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+        has_initial_state = torch.zeros(2, device="cuda", dtype=torch.bool)
+        with torch.no_grad():
+            expected, _ = recurrent_gdn(
+                l2norm(q, cu_seqlens=cu_seqlens),
+                l2norm(k, cu_seqlens=cu_seqlens),
+                v,
+                decay,
+                update_gate,
+                state_cache,
+                cu_seqlens=cu_seqlens,
+                scale=key_dim**-0.5,
+                state_indices=state_indices,
+                has_initial_state=has_initial_state,
+                autotune=False,
+                impl="fused",
+            )
+
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        actual.float().sum().backward()
+        for tensor in (q, k, v, decay, update_gate):
+            self.assertIsNotNone(tensor.grad)
+            self.assertTrue(torch.isfinite(tensor.grad).all())
 
     def test_varlen_offsets_are_fresh_per_deltanet_invocation(self):
         """Successive DeltaNet invocations must not share FLA's cache key."""

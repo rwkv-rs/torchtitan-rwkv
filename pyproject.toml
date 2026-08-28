@@ -28,7 +28,7 @@ dependencies = [
     "einops",
     "pillow",
     "spmd_types==0.2.5",
-    "attn-gym[linear]==0.0.5",
+    "attn-gym[linear] @ git+https://github.com/meta-pytorch/attention-gym.git@ebcd266005a9b1c7064d70c216170b1f21e67b42",
 ]
 dynamic = ["version"]
 
