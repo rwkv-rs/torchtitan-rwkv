@@ -4,7 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchtitan.components.data.collators import Collator, TextCollator, TrainerBatch
+from torchtitan.components.data.collators import (
+    Collator,
+    FixedRowTextCollator,
+    TextCollator,
+    TrainerBatch,
+)
 from torchtitan.components.data.dataset import (
     DatasetConcatConfig,
     DatasetConfig,
@@ -37,6 +42,7 @@ __all__ = [
     "DatasetIterationPolicy",
     "DatasetMixConfig",
     "FirstFitPackingConfig",
+    "FixedRowTextCollator",
     "GrainDataLoader",
     "HuggingFaceRandomAccessSource",
     "HuggingFaceStreamingSource",

@@ -14,7 +14,7 @@ import torch.nn as nn
 
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.linear import Linear
-from torchtitan.protocols.model import ModelConfigConverter
+from torchtitan.protocols.model import make_frozen_config, ModelConfigConverter
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import ShardingConfig
 from torchtitan.tools.logging import logger
@@ -55,7 +55,6 @@ def _lora_adapter_sharding(
 
 
 _lora_class_cache: dict[type, type] = {}
-_frozen_config_class_cache: dict[type, type] = {}
 
 
 def _get_lora_cls(parent_cls: type) -> type:
@@ -110,32 +109,6 @@ def _get_lora_cls(parent_cls: type) -> type:
     LoRALinear.__qualname__ = f"LoRA{parent_cls.__name__}"
     _lora_class_cache[parent_cls] = LoRALinear
     return LoRALinear
-
-
-def _get_frozen_config_cls(
-    config_cls: type[Module.Config],
-) -> type[Module.Config]:
-    """Get or create a config subclass that freezes direct build parameters."""
-    if config_cls in _frozen_config_class_cache:
-        return _frozen_config_class_cache[config_cls]
-
-    class FrozenConfig(config_cls):  # type: ignore[valid-type, misc]
-        def build(self, **kwargs):
-            instance = config_cls.build(self, **kwargs)
-            for param in instance.parameters(recurse=False):
-                param.requires_grad_(False)
-            return instance
-
-    FrozenConfig.__name__ = f"Frozen{config_cls.__name__}"
-    FrozenConfig.__qualname__ = f"Frozen{config_cls.__qualname__}"
-    _frozen_config_class_cache[config_cls] = FrozenConfig
-    return FrozenConfig
-
-
-def _make_frozen_config(cfg: Module.Config) -> Module.Config:
-    """Create a frozen config that still passes checks for the original type."""
-    frozen_cls = _get_frozen_config_cls(type(cfg))
-    return frozen_cls(**{f.name: getattr(cfg, f.name) for f in fields(cfg) if f.init})
 
 
 class LoRAConverter(ModelConfigConverter):
@@ -215,7 +188,7 @@ class LoRAConverter(ModelConfigConverter):
                 new_cfg = self._make_lora_config(cfg)
                 matched.add(last_segment)
             else:
-                new_cfg = _make_frozen_config(cfg)
+                new_cfg = make_frozen_config(cfg)
 
             if parent is None:
                 converted_root = new_cfg

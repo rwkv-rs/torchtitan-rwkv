@@ -77,3 +77,70 @@ class TextCollator(Collator):
             "input": input_ids,
             "positions": positions,
         }, labels
+
+
+class FixedRowTextCollator(Collator):
+    """Pads each text sample into one independent fixed-length batch row."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Collator.Config):
+        pass
+
+    def __init__(self, config: Config, *, context: DatasetBuildContext) -> None:
+        del config
+        if context.tokenizer.eos_id is None:
+            raise ValueError("FixedRowTextCollator requires a tokenizer EOS token.")
+        if context.num_tokens_per_batch % context.max_context_length != 0:
+            raise ValueError(
+                "Fixed-row token batches must be divisible by max_context_length."
+            )
+        self._eos_id = context.tokenizer.eos_id
+        self._max_context_length = context.max_context_length
+        self._num_rows_per_batch = (
+            context.num_tokens_per_batch // context.max_context_length
+        )
+
+    def num_rows_per_batch(self) -> int:
+        return self._num_rows_per_batch
+
+    def __call__(self, rows: Sequence[TextSequence]) -> TrainerBatch:
+        if len(rows) != self._num_rows_per_batch:
+            raise ValueError(
+                "FixedRowTextCollator requires exactly "
+                f"{self._num_rows_per_batch} rows, got {len(rows)}."
+            )
+
+        input_rows = []
+        label_rows = []
+        for row in rows:
+            num_tokens = len(row.input_ids)
+            if num_tokens > self._max_context_length:
+                raise ValueError(
+                    "A fixed-row text sample exceeds max_context_length: "
+                    f"{num_tokens} > {self._max_context_length}."
+                )
+            if len(row.labels) != num_tokens:
+                raise ValueError(
+                    "TextSequence input_ids and labels must have equal length."
+                )
+            input_row = torch.full(
+                (self._max_context_length,),
+                self._eos_id,
+                dtype=torch.long,
+            )
+            label_row = torch.full(
+                (self._max_context_length,),
+                IGNORE_INDEX,
+                dtype=torch.long,
+            )
+            input_row[:num_tokens] = torch.as_tensor(row.input_ids)
+            label_row[:num_tokens] = torch.as_tensor(row.labels)
+            input_rows.append(input_row)
+            label_rows.append(label_row)
+
+        input_ids = torch.stack(input_rows).reshape(-1)
+        labels = torch.stack(label_rows).reshape(-1)
+        positions = torch.arange(self._max_context_length).repeat(
+            self._num_rows_per_batch
+        )
+        return {"input": input_ids, "positions": positions}, labels
