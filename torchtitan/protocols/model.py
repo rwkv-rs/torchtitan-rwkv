@@ -5,8 +5,8 @@
 # LICENSE file in the root directory of this source tree.
 
 from abc import abstractmethod
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, fields
+from typing import Any, ClassVar
 
 import torch
 
@@ -14,6 +14,39 @@ from torchtitan.config import Configurable, ParallelismConfig
 from torchtitan.distributed.parallel_dims import ParallelDims
 
 from .module import Module
+
+
+_frozen_config_class_cache: dict[
+    type[Module.Config],
+    type[Module.Config],
+] = {}
+
+
+def make_frozen_config(config: Module.Config) -> Module.Config:
+    """Create a config that freezes the module parameters it directly owns."""
+    config_cls = type(config)
+    frozen_cls = _frozen_config_class_cache.get(config_cls)
+    if frozen_cls is None:
+
+        class FrozenConfig(config_cls):  # type: ignore[valid-type, misc]
+            def build(self, **kwargs):
+                instance = config_cls.build(self, **kwargs)
+                for parameter in instance.parameters(recurse=False):
+                    parameter.requires_grad_(False)
+                return instance
+
+        FrozenConfig.__name__ = f"Frozen{config_cls.__name__}"
+        FrozenConfig.__qualname__ = f"Frozen{config_cls.__qualname__}"
+        frozen_cls = FrozenConfig
+        _frozen_config_class_cache[config_cls] = frozen_cls
+
+    return frozen_cls(
+        **{
+            field.name: getattr(config, field.name)
+            for field in fields(config)
+            if field.init
+        }
+    )
 
 
 class ModelConfigConverter(Configurable):
@@ -26,7 +59,8 @@ class ModelConfigConverter(Configurable):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        pass
+        incompatible_converter_types: ClassVar[tuple[type, ...]] = ()
+        """Converter config types that cannot be combined with this converter."""
 
     @abstractmethod
     def convert(self, model_config: Module.Config) -> Module.Config:
