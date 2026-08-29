@@ -4,11 +4,16 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from .converter import RWKV7StateTuningConverter
-from .model import RWKV7StateTuningChannelMix, RWKV7StateTuningTimeMix
+from .converter import RWKVStateTuningConverter
+from .model import (
+    RWKVStateTuningAttention,
+    RWKVStateTuningFeedForward,
+    RWKVStateTuningModel,
+)
 
 __all__ = [
-    "RWKV7StateTuningChannelMix",
-    "RWKV7StateTuningConverter",
-    "RWKV7StateTuningTimeMix",
+    "RWKVStateTuningAttention",
+    "RWKVStateTuningConverter",
+    "RWKVStateTuningFeedForward",
+    "RWKVStateTuningModel",
 ]

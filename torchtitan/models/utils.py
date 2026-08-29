@@ -20,33 +20,23 @@ from torch.distributed.tensor.placement_types import (
 
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.moe import MoE
-from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.state_dict_adapter import StateDictAdapter
 from torchtitan.tools.logging import logger
 
 
-def validate_converter_order(
-    converters: list[ModelConfigConverter.Config],
-) -> None:
-    """Validate converter ordering and declared pairwise incompatibilities."""
+def validate_converter_order(converters: list) -> None:
+    """Validate that quantization/QAT converters precede LoRA.
+
+    Raises ``ValueError`` if a quantization converter appears after a LoRA
+    converter in the list.
+    """
     from torchtitan.components.lora import LoRAConverter
     from torchtitan.components.quantization import QuantizationConverter
 
     _BEFORE_LORA = (QuantizationConverter.Config,)
 
     seen_lora = False
-    for index, converter in enumerate(converters):
-        for other in converters[index + 1 :]:
-            incompatible = converter.incompatible_converter_types
-            reverse_incompatible = other.incompatible_converter_types
-            if isinstance(other, incompatible) or isinstance(
-                converter,
-                reverse_incompatible,
-            ):
-                raise ValueError(
-                    f"{type(converter).__qualname__} and "
-                    f"{type(other).__qualname__} cannot be combined."
-                )
+    for converter in converters:
         if isinstance(converter, LoRAConverter.Config):
             seen_lora = True
         elif seen_lora and isinstance(converter, _BEFORE_LORA):

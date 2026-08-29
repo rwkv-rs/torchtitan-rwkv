@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""RWKV7 native LoRA artifacts, PEFT conversion, and base-weight merging."""
+"""RWKV-7 native LoRA artifacts, PEFT conversion, and base-weight merging."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from safetensors.torch import load_file, save_file
 
 NATIVE_ADAPTER_FORMAT = "torchtitan_rwkv_lora"
 NATIVE_ADAPTER_VERSION = 1
-RWKV7_LORA_TARGETS = ("r_proj", "k_proj", "v_proj", "o_proj")
+RWKV_LORA_TARGETS = ("r_proj", "k_proj", "v_proj", "o_proj")
 
 _NATIVE_KEY_PATTERN = re.compile(
     r"^layers\.(?P<layer>\d+)\.linear_attn\."
@@ -42,7 +42,7 @@ _PEFT_KEY_PATTERN = re.compile(
 def _native_key_match(key: str) -> re.Match[str]:
     match = _NATIVE_KEY_PATTERN.fullmatch(key)
     if match is None:
-        raise ValueError(f"Invalid RWKV7 native adapter tensor key {key!r}.")
+        raise ValueError(f"Invalid RWKV-7 native adapter tensor key {key!r}.")
     return match
 
 
@@ -84,10 +84,9 @@ def build_native_adapter_config(
     *,
     base_model_path: str | os.PathLike[str],
     alpha: float,
-    architecture: str = "rwkv7",
 ) -> dict[str, Any]:
     if not state_dict:
-        raise ValueError("RWKV7 native adapter state is empty.")
+        raise ValueError("RWKV-7 native adapter state is empty.")
 
     ranks = set()
     targets = set()
@@ -102,13 +101,13 @@ def build_native_adapter_config(
             ranks.add(tensor.shape[1])
 
     if len(ranks) != 1:
-        raise ValueError(f"RWKV7 adapter tensors have inconsistent ranks: {ranks}.")
+        raise ValueError(f"RWKV-7 adapter tensors have inconsistent ranks: {ranks}.")
     if len(dtypes) != 1:
-        raise ValueError(f"RWKV7 adapter tensors have inconsistent dtypes: {dtypes}.")
-    if targets != set(RWKV7_LORA_TARGETS):
+        raise ValueError(f"RWKV-7 adapter tensors have inconsistent dtypes: {dtypes}.")
+    if targets != set(RWKV_LORA_TARGETS):
         raise ValueError(
-            "RWKV7 native adapter targets must be exactly "
-            f"{list(RWKV7_LORA_TARGETS)}, got {sorted(targets)}."
+            "RWKV-7 native adapter targets must be exactly "
+            f"{list(RWKV_LORA_TARGETS)}, got {sorted(targets)}."
         )
 
     rank = ranks.pop()
@@ -116,12 +115,12 @@ def build_native_adapter_config(
     return {
         "format": NATIVE_ADAPTER_FORMAT,
         "version": NATIVE_ADAPTER_VERSION,
-        "architecture": architecture,
+        "architecture": "rwkv7",
         "base_model": base_model_path.name,
         "base_config_sha256": base_config_sha256(base_model_path),
         "rank": rank,
         "alpha": alpha,
-        "targets": list(RWKV7_LORA_TARGETS),
+        "targets": list(RWKV_LORA_TARGETS),
         "dtype": dtypes.pop(),
     }
 
@@ -137,7 +136,7 @@ def _validate_native_metadata(
         "architecture": "rwkv7",
         "base_model": Path(base_model_path).name,
         "base_config_sha256": base_config_sha256(base_model_path),
-        "targets": list(RWKV7_LORA_TARGETS),
+        "targets": list(RWKV_LORA_TARGETS),
     }
     mismatches = {
         key: {"expected": value, "actual": metadata.get(key)}
@@ -145,14 +144,14 @@ def _validate_native_metadata(
         if metadata.get(key) != value
     }
     if mismatches:
-        raise ValueError(f"RWKV7 native adapter metadata mismatch: {mismatches}.")
+        raise ValueError(f"RWKV-7 native adapter metadata mismatch: {mismatches}.")
     if not isinstance(metadata.get("rank"), int) or metadata["rank"] <= 0:
-        raise ValueError("RWKV7 native adapter rank must be a positive integer.")
+        raise ValueError("RWKV-7 native adapter rank must be a positive integer.")
     if not isinstance(metadata.get("alpha"), (int, float)):
-        raise ValueError("RWKV7 native adapter alpha must be numeric.")
+        raise ValueError("RWKV-7 native adapter alpha must be numeric.")
     if metadata.get("dtype") not in {"bfloat16", "float16", "float32"}:
         raise ValueError(
-            f"RWKV7 native adapter has unsupported dtype {metadata.get('dtype')!r}."
+            f"RWKV-7 native adapter has unsupported dtype {metadata.get('dtype')!r}."
         )
 
 
@@ -168,7 +167,7 @@ def validate_native_adapter(
 
     tensor_path = adapter_path / "adapter_model.safetensors"
     if not tensor_path.is_file():
-        raise ValueError(f"RWKV7 native adapter is missing {tensor_path}.")
+        raise ValueError(f"RWKV-7 native adapter is missing {tensor_path}.")
     actual_shapes = {}
     actual_dtypes = {}
     layers = set()
@@ -178,37 +177,37 @@ def validate_native_adapter(
         for key in tensors.keys():
             match = _NATIVE_KEY_PATTERN.fullmatch(key)
             if match is None:
-                raise ValueError(f"Invalid RWKV7 native adapter tensor key {key!r}.")
+                raise ValueError(f"Invalid RWKV-7 native adapter tensor key {key!r}.")
             tensor_slice = tensors.get_slice(key)
             shape = tuple(tensor_slice.get_shape())
             actual_shapes[key] = shape
             actual_dtypes[key] = tensor_slice.get_dtype()
-            layer_id = int(match.group("layer"))
+            layer_idx = int(match.group("layer"))
             target = match.group("target")
             side = match.group("side")
-            layers.add(layer_id)
-            targets_by_layer.setdefault(layer_id, set()).add(target)
-            sides_by_module.setdefault((layer_id, target), set()).add(side)
+            layers.add(layer_idx)
+            targets_by_layer.setdefault(layer_idx, set()).add(target)
+            sides_by_module.setdefault((layer_idx, target), set()).add(side)
 
     base_config = _read_json(Path(base_model_path) / "config.json")
     num_layers = base_config.get("num_hidden_layers")
     if not isinstance(num_layers, int) or num_layers <= 0:
-        raise ValueError("RWKV7 base config requires positive num_hidden_layers.")
+        raise ValueError("RWKV-7 base config requires positive num_hidden_layers.")
     if layers != set(range(num_layers)):
         raise ValueError(
-            "RWKV7 native adapter layer set does not match the base model: "
+            "RWKV-7 native adapter layer set does not match the base model: "
             f"expected={list(range(num_layers))}, actual={sorted(layers)}."
         )
-    for layer_id in layers:
-        if targets_by_layer[layer_id] != set(RWKV7_LORA_TARGETS):
+    for layer_idx in layers:
+        if targets_by_layer[layer_idx] != set(RWKV_LORA_TARGETS):
             raise ValueError(
-                f"RWKV7 adapter layer {layer_id} has targets "
-                f"{sorted(targets_by_layer[layer_id])}."
+                f"RWKV-7 adapter layer {layer_idx} has targets "
+                f"{sorted(targets_by_layer[layer_idx])}."
             )
-        for target in RWKV7_LORA_TARGETS:
-            if sides_by_module[(layer_id, target)] != {"a", "b"}:
+        for target in RWKV_LORA_TARGETS:
+            if sides_by_module[(layer_idx, target)] != {"a", "b"}:
                 raise ValueError(
-                    f"RWKV7 adapter layer {layer_id} target {target} requires A and B."
+                    f"RWKV-7 adapter layer {layer_idx} target {target} requires A and B."
                 )
 
     rank = metadata["rank"]
@@ -218,7 +217,7 @@ def validate_native_adapter(
         expected_shape = (rank, hidden_size) if side == "a" else (hidden_size, rank)
         if shape != expected_shape:
             raise ValueError(
-                f"RWKV7 adapter tensor {key} has shape {shape}, expected {expected_shape}."
+                f"RWKV-7 adapter tensor {key} has shape {shape}, expected {expected_shape}."
             )
 
     expected_dtype = {
@@ -232,12 +231,12 @@ def validate_native_adapter(
         if dtype != expected_dtype
     }
     if bad_dtypes:
-        raise ValueError(f"RWKV7 adapter tensor dtype mismatch: {bad_dtypes}.")
+        raise ValueError(f"RWKV-7 adapter tensor dtype mismatch: {bad_dtypes}.")
 
     if expected_shapes is not None:
         if set(actual_shapes) != set(expected_shapes):
             raise ValueError(
-                "RWKV7 adapter keys do not match the configured LoRA model: "
+                "RWKV-7 adapter keys do not match the configured LoRA model: "
                 f"missing={sorted(set(expected_shapes) - set(actual_shapes))}, "
                 f"unexpected={sorted(set(actual_shapes) - set(expected_shapes))}."
             )
@@ -248,7 +247,7 @@ def validate_native_adapter(
         }
         if bad_shapes:
             raise ValueError(
-                f"RWKV7 adapter shapes do not match the configured model: {bad_shapes}."
+                f"RWKV-7 adapter shapes do not match the configured model: {bad_shapes}."
             )
     return metadata, actual_shapes
 
@@ -303,7 +302,7 @@ def _native_to_peft_key(key: str) -> str:
 def _peft_to_native_key(key: str) -> str:
     match = _PEFT_KEY_PATTERN.fullmatch(key)
     if match is None:
-        raise ValueError(f"Invalid RWKV7 PEFT adapter tensor key {key!r}.")
+        raise ValueError(f"Invalid RWKV-7 PEFT adapter tensor key {key!r}.")
     return (
         f"layers.{match.group('layer')}.linear_attn.{match.group('target')}."
         f"lora_{match.group('side').lower()}.weight"
@@ -368,17 +367,17 @@ def peft_to_native(
         if peft_config.get(key) != value
     }
     if mismatches:
-        raise ValueError(f"RWKV7 PEFT adapter config mismatch: {mismatches}.")
-    if set(peft_config.get("target_modules", [])) != set(RWKV7_LORA_TARGETS):
+        raise ValueError(f"RWKV-7 PEFT adapter config mismatch: {mismatches}.")
+    if set(peft_config.get("target_modules", [])) != set(RWKV_LORA_TARGETS):
         raise ValueError(
-            "RWKV7 PEFT adapter target_modules must be exactly "
-            f"{list(RWKV7_LORA_TARGETS)}."
+            "RWKV-7 PEFT adapter target_modules must be exactly "
+            f"{list(RWKV_LORA_TARGETS)}."
         )
     rank = peft_config.get("r")
     alpha = peft_config.get("lora_alpha")
     if not isinstance(rank, int) or rank <= 0 or not isinstance(alpha, (int, float)):
         raise ValueError(
-            "RWKV7 PEFT adapter requires positive r and numeric lora_alpha."
+            "RWKV-7 PEFT adapter requires positive r and numeric lora_alpha."
         )
 
     peft_tensors = load_file(peft_path / "adapter_model.safetensors", device="cpu")
@@ -397,7 +396,7 @@ def peft_to_native(
     )
     if metadata["rank"] != rank:
         raise ValueError(
-            "RWKV7 PEFT adapter tensor rank does not match adapter_config.json: "
+            "RWKV-7 PEFT adapter tensor rank does not match adapter_config.json: "
             f"tensors={metadata['rank']}, config={rank}."
         )
     _write_json(output_path / "adapter_config.json", metadata)
@@ -464,7 +463,7 @@ def merge_native_adapter(
         for key in set(shard).intersection(deltas):
             adapter_a, adapter_b = deltas[key]
             if adapter_a is None or adapter_b is None:
-                raise ValueError(f"RWKV7 adapter is missing an A/B tensor for {key}.")
+                raise ValueError(f"RWKV-7 adapter is missing an A/B tensor for {key}.")
             base_weight = shard[key]
             delta = adapter_b.float() @ adapter_a.float()
             shard[key] = (base_weight.float() + scaling * delta).to(base_weight.dtype)
@@ -477,7 +476,7 @@ def merge_native_adapter(
 
     if merged_keys != set(deltas):
         raise ValueError(
-            "RWKV7 base checkpoint is missing adapter targets: "
+            "RWKV-7 base checkpoint is missing adapter targets: "
             f"{sorted(set(deltas) - merged_keys)}."
         )
 
@@ -521,7 +520,7 @@ __all__ = [
     "NATIVE_ADAPTER_FORMAT",
     "NATIVE_ADAPTER_VERSION",
     "peft_to_native",
-    "RWKV7_LORA_TARGETS",
+    "RWKV_LORA_TARGETS",
     "save_native_adapter",
     "validate_native_adapter",
 ]

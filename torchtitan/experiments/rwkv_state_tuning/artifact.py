@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Versioned RWKV7 State Tuning artifacts."""
+"""Versioned RWKV-7 State Tuning artifacts."""
 
 from __future__ import annotations
 
@@ -27,8 +27,8 @@ STATE_ARTIFACT_VERSION = 1
 
 _STATE_KEY_PATTERN = re.compile(
     r"^layers\.(?P<layer>\d+)\."
-    r"(?:(?:linear_attn\.(?P<time>initial_shift|initial_wkv_state))|"
-    r"(?:mlp\.(?P<channel>initial_shift)))$"
+    r"(?:(?:linear_attn\.(?P<attention>initial_attention_shift|initial_wkv_state))|"
+    r"(?:mlp\.(?P<feed_forward>initial_feed_forward_shift)))$"
 )
 
 
@@ -46,7 +46,7 @@ def build_state_artifact_config(
     base_model_path: str | os.PathLike[str],
 ) -> dict[str, Any]:
     if not state_dict:
-        raise ValueError("RWKV7 State Tuning artifact state is empty.")
+        raise ValueError("RWKV-7 State Tuning artifact state is empty.")
     with open(Path(base_model_path) / "config.json") as file:
         base_config = json.load(file)
     return {
@@ -92,17 +92,17 @@ def validate_state_artifact(
         if metadata.get(key) != value
     }
     if mismatches:
-        raise ValueError(f"RWKV7 State Tuning metadata mismatch: {mismatches}.")
+        raise ValueError(f"RWKV-7 State Tuning metadata mismatch: {mismatches}.")
 
     tensor_path = artifact_path / "state_model.safetensors"
     if not tensor_path.is_file():
-        raise ValueError(f"RWKV7 State Tuning artifact is missing {tensor_path}.")
+        raise ValueError(f"RWKV-7 State Tuning artifact is missing {tensor_path}.")
     actual_shapes = {}
     actual_dtypes = {}
     with safe_open(tensor_path, framework="pt", device="cpu") as tensors:
         for key in tensors.keys():
             if _STATE_KEY_PATTERN.fullmatch(key) is None:
-                raise ValueError(f"Invalid RWKV7 State Tuning tensor key {key!r}.")
+                raise ValueError(f"Invalid RWKV-7 State Tuning tensor key {key!r}.")
             actual_shapes[key] = tuple(tensors.get_slice(key).get_shape())
             actual_dtypes[key] = tensors.get_slice(key).get_dtype()
 
@@ -111,21 +111,23 @@ def validate_state_artifact(
     head_size = base_config["head_size"]
     num_heads = hidden_size // head_size
     expected = {}
-    for layer_id in range(num_layers):
+    for layer_idx in range(num_layers):
         expected.update(
             {
-                f"layers.{layer_id}.linear_attn.initial_shift": (hidden_size,),
-                f"layers.{layer_id}.linear_attn.initial_wkv_state": (
+                f"layers.{layer_idx}.linear_attn.initial_attention_shift": (
+                    hidden_size,
+                ),
+                f"layers.{layer_idx}.linear_attn.initial_wkv_state": (
                     num_heads,
                     head_size,
                     head_size,
                 ),
-                f"layers.{layer_id}.mlp.initial_shift": (hidden_size,),
+                f"layers.{layer_idx}.mlp.initial_feed_forward_shift": (hidden_size,),
             }
         )
     if set(actual_shapes) != set(expected):
         raise ValueError(
-            "RWKV7 State Tuning tensor keys do not match the base model: "
+            "RWKV-7 State Tuning tensor keys do not match the base model: "
             f"missing={sorted(set(expected) - set(actual_shapes))}, "
             f"unexpected={sorted(set(actual_shapes) - set(expected))}."
         )
@@ -135,19 +137,19 @@ def validate_state_artifact(
         if expected[key] != actual_shapes[key]
     }
     if bad_shapes:
-        raise ValueError(f"RWKV7 State Tuning tensor shape mismatch: {bad_shapes}.")
+        raise ValueError(f"RWKV-7 State Tuning tensor shape mismatch: {bad_shapes}.")
     bad_dtypes = {}
     for key, dtype in actual_dtypes.items():
         expected_dtype = "F32" if key.endswith("initial_wkv_state") else "BF16"
         if dtype != expected_dtype:
             bad_dtypes[key] = {"expected": expected_dtype, "actual": dtype}
     if bad_dtypes:
-        raise ValueError(f"RWKV7 State Tuning tensor dtype mismatch: {bad_dtypes}.")
+        raise ValueError(f"RWKV-7 State Tuning tensor dtype mismatch: {bad_dtypes}.")
 
     if expected_shapes is not None:
         if dict(expected_shapes) != actual_shapes:
             raise ValueError(
-                "RWKV7 State Tuning artifact does not match the configured model."
+                "RWKV-7 State Tuning artifact does not match the configured model."
             )
     return metadata, actual_shapes
 

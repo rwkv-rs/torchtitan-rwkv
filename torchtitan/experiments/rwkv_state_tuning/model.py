@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""State-tuning replacements for RWKV7 TimeMix and ChannelMix."""
+"""State-tuning replacements for RWKV-7 TimeMix and ChannelMix."""
 
 from __future__ import annotations
 
@@ -14,21 +14,23 @@ from typing import ClassVar
 import torch
 from torch import nn
 
-from torchtitan.models.rwkv7.model import RWKV7ChannelMix, RWKV7TimeMix
+from torchtitan.components.lora import _get_lora_cls
+from torchtitan.models.common.linear import Linear
+from torchtitan.models.rwkv7.model import RWKVAttention, RWKVFeedForward, RWKVModel
 from torchtitan.models.rwkv7.provider import (
-    load_flash_rwkv2,
-    STATE_TUNING_CHANNELMIX_OPERATORS,
-    STATE_TUNING_TIMEMIX_OPERATORS,
+    STATE_TUNING_ATTENTION_OPERATORS,
+    STATE_TUNING_FEED_FORWARD_OPERATORS,
 )
 from torchtitan.protocols.module import Module
 
 
 # Shape suffixes in this file:
-# B: batch lanes, T: tokens per lane, C: model channels, H: recurrent heads,
-# K: recurrent head width, P: sequence boundaries, Q: recurrent chunks.
+# B: batch lanes, T: tokens per lane, N: total tokens, C: model channels,
+# H: recurrent heads, K: recurrent head width, P: sequence boundaries,
+# Q: chunks per sequence, R: total recurrent chunks.
 
 
-class _RWKV7WKVState(Module):
+class _WKVState(Module):
     """Own the FP32 WKV state as an independently shardable FSDP unit."""
 
     def __init__(self, num_heads: int, head_size: int):
@@ -48,22 +50,22 @@ class _RWKV7WKVState(Module):
         )
 
 
-class RWKV7StateTuningTimeMix(RWKV7TimeMix):
-    """TimeMix with trainable lane-broadcast initial shift and WKV state."""
+class RWKVStateTuningAttention(RWKVAttention):
+    """Attention with trainable lane-broadcast shift and WKV state."""
 
-    _provider_operators: ClassVar[tuple[str, ...]] = STATE_TUNING_TIMEMIX_OPERATORS
-    _provider_mode: ClassVar[str] = "TimeMix state tuning"
+    _provider_operators: ClassVar[tuple[str, ...]] = STATE_TUNING_ATTENTION_OPERATORS
+    _provider_mode: ClassVar[str] = "attention state tuning"
 
     @dataclass(kw_only=True, slots=True)
-    class Config(RWKV7TimeMix.Config):
+    class Config(RWKVAttention.Config):
         pass
 
     def __init__(self, config: Config):
         super().__init__(config)
-        for parameter in self.parameters():
-            parameter.requires_grad_(False)
-        self.initial_shift = nn.Parameter(torch.empty(config.dim, dtype=torch.bfloat16))
-        self._wkv_state = _RWKV7WKVState(
+        self.initial_attention_shift = nn.Parameter(
+            torch.empty(config.dim, dtype=torch.bfloat16)
+        )
+        self._wkv_state = _WKVState(
             config.dim // config.head_size,
             config.head_size,
         )
@@ -89,7 +91,7 @@ class RWKV7StateTuningTimeMix(RWKV7TimeMix):
             )
 
     @staticmethod
-    def _chunk_metadata(
+    def training_metadata(
         batch_size: int,
         sequence_length: int,
         device: torch.device,
@@ -113,123 +115,102 @@ class RWKV7StateTuningTimeMix(RWKV7TimeMix):
             )
             * 16
         )
-        chunk_starts_BQ = (
-            sequence_starts_B[:, None] + chunk_offsets_Q[None, :]
-        ).flatten()
-        chunk_ends_BQ = chunk_starts_BQ + 16
-        return sequence_chunk_offsets_P, chunk_starts_BQ, chunk_ends_BQ
+        chunk_token_starts_BQ = sequence_starts_B[:, None] + chunk_offsets_Q[None, :]
+        chunk_token_starts_R = chunk_token_starts_BQ.flatten()
+        chunk_token_ends_R = chunk_token_starts_R + 16
+        return sequence_chunk_offsets_P, chunk_token_starts_R, chunk_token_ends_R
 
     def forward(
         self,
-        x_BTC: torch.Tensor,
+        hidden_states_BTC: torch.Tensor,
         v_first_BTC: torch.Tensor | None = None,
+        attention_shift_BC: torch.Tensor | None = None,
+        wkv_state_BHKK: torch.Tensor | None = None,
+        training_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        flash_rwkv2 = load_flash_rwkv2(
-            self._provider_operators,
-            x_BTC,
-            self._provider_mode,
-            preloaded=self._flash_rwkv2,
+        del attention_shift_BC, wkv_state_BHKK, training_metadata
+        batch_size, sequence_length, _ = hidden_states_BTC.shape
+        attention_shift_BC = (
+            self.initial_attention_shift.unsqueeze(0)
+            .expand(batch_size, -1)
+            .contiguous()
         )
-        batch_size, sequence_length, _ = x_BTC.shape
-        shift_BC = self.initial_shift.unsqueeze(0).expand(batch_size, -1).contiguous()
+        wkv_state_BHKK = self._wkv_state(batch_size)
         (
-            xr_BTC,
-            xw_BTC,
-            xk_BTC,
-            xv_BTC,
-            xa_BTC,
-            xg_BTC,
-            _,
-        ) = flash_rwkv2.statetune_tmix_tokenshift_bf16(
-            x_BTC.contiguous(),
-            shift_BC,
-            self.x_r,
-            self.x_w,
-            self.x_k,
-            self.x_v,
-            self.x_a,
-            self.x_g,
-        )
-        r_BTC, w_BTC, k_BTC, v_BTC, kk_BTC, ka_BTC, g_BTC = self._project_shifted(
-            flash_rwkv2,
-            xr_BTC,
-            xw_BTC,
-            xk_BTC,
-            xv_BTC,
-            xa_BTC,
-            xg_BTC,
-            v_first_BTC,
-        )
-        if self.layer_id == 0:
-            v_first_BTC = v_BTC
-        assert v_first_BTC is not None
-
-        initial_state_BHKK = self._wkv_state(batch_size)
-        sequence_offsets_P, chunk_starts_BQ, chunk_ends_BQ = self._chunk_metadata(
+            sequence_chunk_offsets_P,
+            chunk_token_starts_R,
+            chunk_token_ends_R,
+        ) = self.training_metadata(
             batch_size,
             sequence_length,
-            x_BTC.device,
+            hidden_states_BTC.device,
         )
-        recurrent_THK, _, _, _ = flash_rwkv2.statetune_tmix_wkv7_recurrent_fp32io16(
-            initial_state_BHKK,
-            sequence_offsets_P,
-            chunk_starts_BQ,
-            chunk_ends_BQ,
-            r_BTC.view(-1, self.num_heads, self.head_size),
-            w_BTC.view(-1, self.num_heads, self.head_size),
-            k_BTC.view(-1, self.num_heads, self.head_size),
-            v_BTC.view(-1, self.num_heads, self.head_size),
-            kk_BTC.view(-1, self.num_heads, self.head_size),
-            ka_BTC.view(-1, self.num_heads, self.head_size),
-        )
-        recurrent_BTC = recurrent_THK.view(batch_size, sequence_length, self.dim)
-        return (
-            self._readout(
-                flash_rwkv2,
-                recurrent_BTC,
-                r_BTC,
-                k_BTC,
-                v_BTC,
-                g_BTC,
-            ),
+        return super().forward(
+            hidden_states_BTC,
             v_first_BTC,
+            attention_shift_BC,
+            wkv_state_BHKK,
+            (
+                sequence_chunk_offsets_P,
+                chunk_token_starts_R,
+                chunk_token_ends_R,
+            ),
         )
 
 
-class RWKV7StateTuningChannelMix(RWKV7ChannelMix):
-    """ChannelMix with a trainable lane-broadcast initial shift."""
+class RWKVStateTuningFeedForward(RWKVFeedForward):
+    """Feed-forward with a trainable lane-broadcast shift."""
 
-    _provider_operators: ClassVar[tuple[str, ...]] = STATE_TUNING_CHANNELMIX_OPERATORS
-    _provider_mode: ClassVar[str] = "ChannelMix state tuning"
+    _provider_operators: ClassVar[tuple[str, ...]] = STATE_TUNING_FEED_FORWARD_OPERATORS
+    _provider_mode: ClassVar[str] = "feed-forward state tuning"
 
     @dataclass(kw_only=True, slots=True)
-    class Config(RWKV7ChannelMix.Config):
+    class Config(RWKVFeedForward.Config):
         pass
 
     def __init__(self, config: Config):
         super().__init__(config)
-        for parameter in self.parameters():
-            parameter.requires_grad_(False)
-        self.initial_shift = nn.Parameter(torch.empty(config.dim, dtype=torch.bfloat16))
+        self.initial_feed_forward_shift = nn.Parameter(
+            torch.empty(config.dim, dtype=torch.bfloat16)
+        )
 
-    def forward(self, x_BTC: torch.Tensor) -> torch.Tensor:
-        flash_rwkv2 = load_flash_rwkv2(
-            self._provider_operators,
-            x_BTC,
-            self._provider_mode,
-            preloaded=self._flash_rwkv2,
+    def forward(
+        self,
+        hidden_states_BTC: torch.Tensor,
+        feed_forward_shift_BC: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        del feed_forward_shift_BC
+        feed_forward_shift_BC = (
+            self.initial_feed_forward_shift.unsqueeze(0)
+            .expand(hidden_states_BTC.shape[0], -1)
+            .contiguous()
         )
-        shift_BC = (
-            self.initial_shift.unsqueeze(0).expand(x_BTC.shape[0], -1).contiguous()
-        )
-        output_BTC, _ = flash_rwkv2.statetune_cmix_bf16(
-            x_BTC.contiguous(),
-            shift_BC,
-            self.x_k,
-            self.key.weight,
-            self.value.weight,
-        )
-        return output_BTC
+        return super().forward(hidden_states_BTC, feed_forward_shift_BC)
 
 
-__all__ = ["RWKV7StateTuningChannelMix", "RWKV7StateTuningTimeMix"]
+class RWKVStateTuningModel(RWKVModel):
+    """RWKV-7 model with only recurrent initial states trainable."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(RWKVModel.Config):
+        pass
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        if any(isinstance(module, _get_lora_cls(Linear)) for module in self.modules()):
+            raise ValueError("RWKV-7 State Tuning and LoRA cannot be combined.")
+        self.requires_grad_(False)
+        for module in self.modules():
+            if isinstance(module, RWKVStateTuningAttention):
+                module.initial_attention_shift.requires_grad_(True)
+                module.initial_wkv_state.requires_grad_(True)
+            elif isinstance(module, RWKVStateTuningFeedForward):
+                module.initial_feed_forward_shift.requires_grad_(True)
+
+
+__all__ = [
+    "RWKVStateTuningAttention",
+    "RWKVStateTuningFeedForward",
+    "RWKVStateTuningModel",
+]

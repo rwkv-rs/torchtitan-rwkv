@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""RWKV7 checkpoint manager with native LoRA artifact handling."""
+"""RWKV-7 checkpoint manager with native LoRA artifact handling."""
 
 from __future__ import annotations
 
@@ -51,7 +51,7 @@ def finalize_hf_artifact(artifact_path: str, tensor_filename: str) -> None:
         shutil.rmtree(sharded_path)
 
 
-class RWKV7CheckpointManager(CheckpointManager):
+class RWKVCheckpointManager(CheckpointManager):
     """Preserve ordinary DCP behavior and add final native LoRA artifacts."""
 
     @dataclass(kw_only=True, slots=True)
@@ -65,7 +65,7 @@ class RWKV7CheckpointManager(CheckpointManager):
         def __post_init__(self) -> None:
             CheckpointManager.Config.__post_init__(self)
             if not self.adapter_folder:
-                raise ValueError("RWKV7 checkpoint adapter_folder must not be empty.")
+                raise ValueError("RWKV-7 checkpoint adapter_folder must not be empty.")
 
     def __init__(self, config: Config, **kwargs: Any) -> None:
         self.initial_load_adapter_path = config.initial_load_adapter_path
@@ -78,7 +78,7 @@ class RWKV7CheckpointManager(CheckpointManager):
         if self.sd_adapter is not None and self.sd_adapter.hf_assets_path:
             return self.sd_adapter.hf_assets_path
         raise ValueError(
-            "RWKV7 adapter handling requires an HF base model path with config.json."
+            "RWKV-7 adapter handling requires an HF base model path with config.json."
         )
 
     def _adapter_states(self) -> dict[str, Any]:
@@ -98,7 +98,7 @@ class RWKV7CheckpointManager(CheckpointManager):
         }
         if len(ranks) != 1 or len(scalings) != 1:
             raise ValueError(
-                "RWKV7 LoRA artifact requires one consistent rank and scaling, got "
+                "RWKV-7 LoRA artifact requires one consistent rank and scaling, got "
                 f"ranks={ranks}, scalings={scalings}."
             )
         return ranks.pop() * scalings.pop()
@@ -107,7 +107,7 @@ class RWKV7CheckpointManager(CheckpointManager):
         expected_states = self._adapter_states()
         if not expected_states:
             raise ValueError(
-                "checkpoint.initial_load_adapter_path requires an RWKV7 LoRA model."
+                "checkpoint.initial_load_adapter_path requires an RWKV-7 LoRA model."
             )
         expected_shapes = {
             key: tuple(tensor.shape) for key, tensor in expected_states.items()
@@ -144,7 +144,7 @@ class RWKV7CheckpointManager(CheckpointManager):
             return
         if not self.initial_load_in_hf:
             logger.warning(
-                "Skipping the RWKV7 adapter-only artifact because this run did "
+                "Skipping the RWKV-7 adapter-only artifact because this run did "
                 "not load an HF base model; the full DCP checkpoint remains saved."
             )
             return
@@ -181,4 +181,4 @@ class RWKV7CheckpointManager(CheckpointManager):
         self._save_adapter_artifact(curr_step)
 
 
-__all__ = ["finalize_hf_artifact", "RWKV7CheckpointManager"]
+__all__ = ["finalize_hf_artifact", "RWKVCheckpointManager"]

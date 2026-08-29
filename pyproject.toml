@@ -49,7 +49,7 @@ remat = [
     "torch_remat>=0.2.0",
 ]
 rwkv = [
-    "FlashRWKV2==0.1.0a10",
+    "FlashRWKV2==0.1.0a11",
 ]
 
 [tool.setuptools.dynamic]

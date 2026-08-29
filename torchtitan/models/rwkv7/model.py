@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""RWKV7 training model backed exclusively by FlashRWKV2."""
+"""RWKV-7 training model backed exclusively by FlashRWKV2."""
 
 from __future__ import annotations
 
@@ -26,25 +26,25 @@ from torchtitan.protocols.module import Module, ModuleDict
 from .provider import (
     load_flash_rwkv2,
     preload_flash_rwkv2,
-    PRETRAIN_CHANNELMIX_OPERATORS,
-    PRETRAIN_TIMEMIX_OPERATORS,
+    PRETRAIN_ATTENTION_OPERATORS,
+    PRETRAIN_FEED_FORWARD_OPERATORS,
 )
 
 
 # Shape suffixes in this file:
-# B: batch lanes, T: tokens per lane, C: model channels, H: recurrent heads,
-# K: recurrent head width, F: ChannelMix hidden width.
+# B: batch lanes, T: tokens per lane, N: total tokens, C: model channels,
+# H: recurrent heads, K: recurrent head width, F: feed-forward hidden width.
 
 
-class RWKV7TimeMix(Module):
-    """RWKV7 TimeMix using the fused FlashRWKV2 pretraining operators."""
+class RWKVAttention(Module):
+    """RWKV-7 TimeMix using the fused FlashRWKV2 pretraining operators."""
 
-    _provider_operators: ClassVar[tuple[str, ...]] = PRETRAIN_TIMEMIX_OPERATORS
-    _provider_mode: ClassVar[str] = "TimeMix training"
+    _provider_operators: ClassVar[tuple[str, ...]] = PRETRAIN_ATTENTION_OPERATORS
+    _provider_mode: ClassVar[str] = "attention training"
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        layer_id: int
+        layer_idx: int
         dim: int
         head_size: int
         decay_low_rank_dim: int
@@ -59,7 +59,7 @@ class RWKV7TimeMix(Module):
 
     def __init__(self, config: Config):
         super().__init__()
-        self.layer_id = config.layer_id
+        self.layer_idx = config.layer_idx
         self.dim = config.dim
         self.head_size = config.head_size
         self.num_heads = config.dim // config.head_size
@@ -77,7 +77,7 @@ class RWKV7TimeMix(Module):
         self.a0 = nn.Parameter(torch.empty(config.dim))
         self.a1 = nn.Parameter(torch.empty(config.dim, config.a_low_rank_dim))
         self.a2 = nn.Parameter(torch.empty(config.a_low_rank_dim, config.dim))
-        if config.layer_id != 0:
+        if config.layer_idx != 0:
             self.v0 = nn.Parameter(torch.empty(config.dim))
             self.v1 = nn.Parameter(torch.empty(config.dim, config.v_low_rank_dim))
             self.v2 = nn.Parameter(torch.empty(config.v_low_rank_dim, config.dim))
@@ -101,145 +101,150 @@ class RWKV7TimeMix(Module):
             self._provider_mode,
         )
 
-    def _project_shifted(
+    def forward(
         self,
-        flash_rwkv2: ModuleType,
-        xr_BTC: torch.Tensor,
-        xw_BTC: torch.Tensor,
-        xk_BTC: torch.Tensor,
-        xv_BTC: torch.Tensor,
-        xa_BTC: torch.Tensor,
-        xg_BTC: torch.Tensor,
-        v_first_BTC: torch.Tensor | None,
-    ) -> tuple[
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ]:
-        r_BTC = self.r_proj(xr_BTC).contiguous()
-        w_BTC = (self.w0 + torch.tanh(xw_BTC @ self.w1) @ self.w2).contiguous()
-        k_BTC = self.k_proj(xk_BTC).contiguous()
-        v_BTC = self.v_proj(xv_BTC).contiguous()
-        if self.layer_id == 0:
-            v_first_BTC = v_BTC
+        hidden_states_BTC: torch.Tensor,
+        v_first_BTC: torch.Tensor | None = None,
+        attention_shift_BC: torch.Tensor | None = None,
+        wkv_state_BHKK: torch.Tensor | None = None,
+        training_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        flash_rwkv2 = load_flash_rwkv2(
+            self._provider_operators,
+            hidden_states_BTC,
+            self._provider_mode,
+            preloaded=self._flash_rwkv2,
+        )
+        hidden_states_BTC = hidden_states_BTC.contiguous()
+        if attention_shift_BC is None:
+            (
+                xr_BTC,
+                xw_BTC,
+                xk_BTC,
+                xv_BTC,
+                xa_BTC,
+                xg_BTC,
+            ) = flash_rwkv2.pretrain_tmix_tokenshift_bf16(
+                hidden_states_BTC,
+                self.x_r,
+                self.x_w,
+                self.x_k,
+                self.x_v,
+                self.x_a,
+                self.x_g,
+            )
+        else:
+            (
+                xr_BTC,
+                xw_BTC,
+                xk_BTC,
+                xv_BTC,
+                xa_BTC,
+                xg_BTC,
+                _,
+            ) = flash_rwkv2.statetune_tmix_tokenshift_bf16(
+                hidden_states_BTC,
+                attention_shift_BC.contiguous(),
+                self.x_r,
+                self.x_w,
+                self.x_k,
+                self.x_v,
+                self.x_a,
+                self.x_g,
+            )
+
+        receptance_BTC = self.r_proj(xr_BTC).contiguous()
+        decay_logits_BTC = (
+            self.w0 + torch.tanh(xw_BTC @ self.w1) @ self.w2
+        ).contiguous()
+        key_BTC = self.k_proj(xk_BTC).contiguous()
+        value_BTC = self.v_proj(xv_BTC).contiguous()
+        if self.layer_idx == 0:
+            v_first_BTC = value_BTC
         else:
             assert v_first_BTC is not None
             v12_BTC = ((xv_BTC @ self.v1) @ self.v2).contiguous()
-            v_BTC = flash_rwkv2.pretrain_tmix_vres_gate_bf16(
-                v_BTC,
+            value_BTC = flash_rwkv2.pretrain_tmix_vres_gate_bf16(
+                value_BTC,
                 v_first_BTC,
                 self.v0,
                 v12_BTC,
             )
+        assert v_first_BTC is not None
 
-        a_BTC = flash_rwkv2.pretrain_tmix_a_gate_bf16(
+        recurrent_gate_BTC = flash_rwkv2.pretrain_tmix_a_gate_bf16(
             self.a0,
             ((xa_BTC @ self.a1) @ self.a2).contiguous(),
         )
-        g_BTC = (torch.sigmoid(xg_BTC @ self.g1) @ self.g2).contiguous()
-        k_BTC, kk_BTC, ka_BTC = flash_rwkv2.pretrain_tmix_kk_pre_bf16(
-            k_BTC,
+        gate_BTC = (torch.sigmoid(xg_BTC @ self.g1) @ self.g2).contiguous()
+        (
+            key_BTC,
+            negative_direction_BTC,
+            scaled_direction_BTC,
+        ) = flash_rwkv2.pretrain_tmix_kk_pre_bf16(
+            key_BTC,
             self.k_k,
-            a_BTC,
+            recurrent_gate_BTC,
             self.k_a,
             head_size=self.head_size,
         )
-        return r_BTC, w_BTC, k_BTC, v_BTC, kk_BTC, ka_BTC, g_BTC
 
-    def _readout(
-        self,
-        flash_rwkv2: ModuleType,
-        recurrent_BTC: torch.Tensor,
-        r_BTC: torch.Tensor,
-        k_BTC: torch.Tensor,
-        v_BTC: torch.Tensor,
-        g_BTC: torch.Tensor,
-    ) -> torch.Tensor:
-        mixed_BTC = flash_rwkv2.pretrain_tmix_readout_bf16(
-            recurrent_BTC.contiguous(),
-            r_BTC,
-            k_BTC,
-            v_BTC,
+        if wkv_state_BHKK is None:
+            recurrent_output_BTC = flash_rwkv2.pretrain_tmix_wkv7_recurrent_bf16(
+                receptance_BTC,
+                decay_logits_BTC,
+                key_BTC,
+                value_BTC,
+                negative_direction_BTC,
+                scaled_direction_BTC,
+                head_size=self.head_size,
+            )
+        else:
+            assert training_metadata is not None
+            (
+                sequence_chunk_offsets_P,
+                chunk_token_starts_R,
+                chunk_token_ends_R,
+            ) = training_metadata
+            (
+                recurrent_output_NHK,
+                _,
+                _,
+                _,
+            ) = flash_rwkv2.statetune_tmix_wkv7_recurrent_fp32io16(
+                wkv_state_BHKK,
+                sequence_chunk_offsets_P,
+                chunk_token_starts_R,
+                chunk_token_ends_R,
+                receptance_BTC.view(-1, self.num_heads, self.head_size),
+                decay_logits_BTC.view(-1, self.num_heads, self.head_size),
+                key_BTC.view(-1, self.num_heads, self.head_size),
+                value_BTC.view(-1, self.num_heads, self.head_size),
+                negative_direction_BTC.view(-1, self.num_heads, self.head_size),
+                scaled_direction_BTC.view(-1, self.num_heads, self.head_size),
+            )
+            recurrent_output_BTC = recurrent_output_NHK.view_as(receptance_BTC)
+
+        output_BTC = flash_rwkv2.pretrain_tmix_readout_bf16(
+            recurrent_output_BTC.contiguous(),
+            receptance_BTC,
+            key_BTC,
+            value_BTC,
             self.r_k,
             self.g_norm.weight,
             self.g_norm.bias,
-            g_BTC,
+            gate_BTC,
             head_size=self.head_size,
         )
-        return self.o_proj(mixed_BTC)
-
-    def forward(
-        self,
-        x_BTC: torch.Tensor,
-        v_first_BTC: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        flash_rwkv2 = load_flash_rwkv2(
-            self._provider_operators,
-            x_BTC,
-            self._provider_mode,
-            preloaded=self._flash_rwkv2,
-        )
-        x_BTC = x_BTC.contiguous()
-        (
-            xr_BTC,
-            xw_BTC,
-            xk_BTC,
-            xv_BTC,
-            xa_BTC,
-            xg_BTC,
-        ) = flash_rwkv2.pretrain_tmix_tokenshift_bf16(
-            x_BTC,
-            self.x_r,
-            self.x_w,
-            self.x_k,
-            self.x_v,
-            self.x_a,
-            self.x_g,
-        )
-        r_BTC, w_BTC, k_BTC, v_BTC, kk_BTC, ka_BTC, g_BTC = self._project_shifted(
-            flash_rwkv2,
-            xr_BTC,
-            xw_BTC,
-            xk_BTC,
-            xv_BTC,
-            xa_BTC,
-            xg_BTC,
-            v_first_BTC,
-        )
-        if self.layer_id == 0:
-            v_first_BTC = v_BTC
-        assert v_first_BTC is not None
-        recurrent_BTC = flash_rwkv2.pretrain_tmix_wkv7_recurrent_bf16(
-            r_BTC,
-            w_BTC,
-            k_BTC,
-            v_BTC,
-            kk_BTC,
-            ka_BTC,
-            head_size=self.head_size,
-        )
-        return (
-            self._readout(
-                flash_rwkv2,
-                recurrent_BTC,
-                r_BTC,
-                k_BTC,
-                v_BTC,
-                g_BTC,
-            ),
-            v_first_BTC,
-        )
+        return self.o_proj(output_BTC), v_first_BTC
 
 
-class RWKV7ChannelMix(Module):
-    """RWKV7 ChannelMix using the fused FlashRWKV2 pretraining operator."""
+class RWKVFeedForward(Module):
+    """RWKV-7 ChannelMix using the fused FlashRWKV2 pretraining operator."""
 
-    _provider_operators: ClassVar[tuple[str, ...]] = PRETRAIN_CHANNELMIX_OPERATORS
-    _provider_mode: ClassVar[str] = "ChannelMix training"
+    _provider_operators: ClassVar[tuple[str, ...]] = PRETRAIN_FEED_FORWARD_OPERATORS
+    _provider_mode: ClassVar[str] = "feed-forward training"
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -260,28 +265,41 @@ class RWKV7ChannelMix(Module):
             self._provider_mode,
         )
 
-    def forward(self, x_BTC: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states_BTC: torch.Tensor,
+        feed_forward_shift_BC: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         flash_rwkv2 = load_flash_rwkv2(
             self._provider_operators,
-            x_BTC,
+            hidden_states_BTC,
             self._provider_mode,
             preloaded=self._flash_rwkv2,
         )
-        return flash_rwkv2.pretrain_cmix_bf16(
-            x_BTC.contiguous(),
+        if feed_forward_shift_BC is None:
+            return flash_rwkv2.pretrain_cmix_bf16(
+                hidden_states_BTC.contiguous(),
+                self.x_k,
+                self.key.weight,
+                self.value.weight,
+            )
+        output_BTC, _ = flash_rwkv2.statetune_cmix_bf16(
+            hidden_states_BTC.contiguous(),
+            feed_forward_shift_BC.contiguous(),
             self.x_k,
             self.key.weight,
             self.value.weight,
         )
+        return output_BTC
 
 
-class RWKV7Block(Module):
-    """One RWKV7 TimeMix and ChannelMix residual block."""
+class RWKVDecoderLayer(Module):
+    """One RWKV-7 decoder layer with TimeMix and ChannelMix residuals."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        linear_attn: RWKV7TimeMix.Config
-        mlp: RWKV7ChannelMix.Config
+        linear_attn: RWKVAttention.Config
+        mlp: RWKVFeedForward.Config
         input_layernorm: LayerNorm.Config
         post_attention_layernorm: LayerNorm.Config
 
@@ -294,20 +312,23 @@ class RWKV7Block(Module):
 
     def forward(
         self,
-        x_BTC: torch.Tensor,
+        hidden_states_BTC: torch.Tensor,
         v_first_BTC: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        attn_BTC, v_first_BTC = self.linear_attn(
-            self.input_layernorm(x_BTC).contiguous(),
+        attention_output_BTC, v_first_BTC = self.linear_attn(
+            self.input_layernorm(hidden_states_BTC).contiguous(),
             v_first_BTC,
         )
-        x_BTC = x_BTC + attn_BTC
-        x_BTC = x_BTC + self.mlp(self.post_attention_layernorm(x_BTC).contiguous())
-        return x_BTC, v_first_BTC
+        hidden_states_BTC = hidden_states_BTC + attention_output_BTC
+        feed_forward_output_BTC = self.mlp(
+            self.post_attention_layernorm(hidden_states_BTC).contiguous()
+        )
+        hidden_states_BTC = hidden_states_BTC + feed_forward_output_BTC
+        return hidden_states_BTC, v_first_BTC
 
 
-class RWKV7Model(BaseModel):
-    """RWKV7 causal language model for TorchTitan training."""
+class RWKVModel(BaseModel):
+    """RWKV-7 causal language model for TorchTitan training."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseModel.Config):
@@ -325,7 +346,7 @@ class RWKV7Model(BaseModel):
         group_norm_epsilon: float
         tok_embeddings: Embedding.Config
         embedding_norm: LayerNorm.Config
-        layers: list[RWKV7Block.Config]
+        layers: list[RWKVDecoderLayer.Config]
         norm: LayerNorm.Config
         lm_head: Linear.Config
         context_length: int = 4096
@@ -333,24 +354,24 @@ class RWKV7Model(BaseModel):
         def __post_init__(self) -> None:
             if self.architecture_version != "rwkv7":
                 raise ValueError(
-                    "RWKV7 architecture_version must be 'rwkv7', got "
+                    "RWKV-7 architecture_version must be 'rwkv7', got "
                     f"{self.architecture_version!r}."
                 )
             if self.head_size != 64:
-                raise ValueError(f"RWKV7 requires head_size=64, got {self.head_size}.")
+                raise ValueError(f"RWKV-7 requires head_size=64, got {self.head_size}.")
             if self.dim <= 0 or self.dim % self.head_size != 0:
                 raise ValueError(
-                    "RWKV7 dim must be positive and divisible by head_size, got "
+                    "RWKV-7 dim must be positive and divisible by head_size, got "
                     f"dim={self.dim}, head_size={self.head_size}."
                 )
             if self.hidden_dim != 4 * self.dim:
                 raise ValueError(
-                    f"RWKV7 hidden_dim must equal 4 * dim ({4 * self.dim}), "
+                    f"RWKV-7 hidden_dim must equal 4 * dim ({4 * self.dim}), "
                     f"got {self.hidden_dim}."
                 )
             if self.num_layers <= 0 or len(self.layers) != self.num_layers:
                 raise ValueError(
-                    "RWKV7 layers must match num_layers, got "
+                    "RWKV-7 layers must match num_layers, got "
                     f"num_layers={self.num_layers}, layers={len(self.layers)}."
                 )
             ranks = {
@@ -362,28 +383,27 @@ class RWKV7Model(BaseModel):
             invalid = {name: rank for name, rank in ranks.items() if rank <= 0}
             if invalid:
                 raise ValueError(
-                    f"RWKV7 low-rank dimensions must be positive: {invalid}."
+                    f"RWKV-7 low-rank dimensions must be positive: {invalid}."
                 )
             if self.layer_norm_epsilon <= 0 or self.group_norm_epsilon <= 0:
-                raise ValueError("RWKV7 normalization epsilons must be positive.")
+                raise ValueError("RWKV-7 normalization epsilons must be positive.")
+            if self.context_length <= 0:
+                raise ValueError(
+                    f"RWKV-7 context_length must be positive, got {self.context_length}."
+                )
 
         def update_from_config(self, *, config, **kwargs) -> None:
             del kwargs
             training = config.training
             parallelism = config.parallelism
-            if self.architecture_version != "rwkv7":
-                raise ValueError(
-                    "RWKV7Model requires architecture_version='rwkv7', got "
-                    f"{self.architecture_version!r}."
-                )
             if training.dtype != "bfloat16":
                 raise ValueError(
-                    "RWKV7 training requires training.dtype='bfloat16', got "
+                    "RWKV-7 training requires training.dtype='bfloat16', got "
                     f"{training.dtype!r}."
                 )
             if training.max_context_length % 16 != 0:
                 raise ValueError(
-                    "RWKV7 training.max_context_length must be a multiple of 16, "
+                    "RWKV-7 training.max_context_length must be a multiple of 16, "
                     f"got {training.max_context_length}."
                 )
             if (
@@ -392,7 +412,7 @@ class RWKV7Model(BaseModel):
                 != 0
             ):
                 raise ValueError(
-                    "RWKV7 num_tokens_per_microbatch_per_dp_rank must be divisible "
+                    "RWKV-7 num_tokens_per_microbatch_per_dp_rank must be divisible "
                     "by training.max_context_length."
                 )
             unsupported = {
@@ -406,7 +426,7 @@ class RWKV7Model(BaseModel):
             }
             if enabled:
                 raise ValueError(
-                    "RWKV7 currently supports only single-device, DP replicate, "
+                    "RWKV-7 currently supports only single-device, DP replicate, "
                     f"and FSDP shard; unsupported parallelism: {enabled}."
                 )
             self.context_length = training.max_context_length
@@ -428,8 +448,8 @@ class RWKV7Model(BaseModel):
         self.tok_embeddings = config.tok_embeddings.build()
         self.embedding_norm = config.embedding_norm.build()
         self.layers = ModuleDict()
-        for layer_id, layer_config in enumerate(config.layers):
-            self.layers[str(layer_id)] = layer_config.build()
+        for layer_idx, layer_config in enumerate(config.layers):
+            self.layers[str(layer_idx)] = layer_config.build()
         self.norm = config.norm.build()
         self.lm_head = config.lm_head.build()
         self.enable_weight_tying = False
@@ -437,21 +457,21 @@ class RWKV7Model(BaseModel):
     def preload_provider(self) -> None:
         """Resolve FlashRWKV2 before block-level full-graph compilation."""
         for layer in self.layers.values():
-            block = cast(RWKV7Block, layer)
-            block.linear_attn.preload_provider()
-            block.mlp.preload_provider()
+            decoder_layer = cast(RWKVDecoderLayer, layer)
+            decoder_layer.linear_attn.preload_provider()
+            decoder_layer.mlp.preload_provider()
 
     def forward(self, tokens_BT: torch.Tensor) -> torch.Tensor:
-        x_BTC = self.tok_embeddings(tokens_BT)
-        x_BTC = self.embedding_norm(x_BTC).contiguous()
+        hidden_states_BTC = self.tok_embeddings(tokens_BT)
+        hidden_states_BTC = self.embedding_norm(hidden_states_BTC).contiguous()
         v_first_BTC = None
         for layer in self.layers.values():
-            x_BTC, v_first_BTC = layer(x_BTC, v_first_BTC)
-        x_BTC = self.norm(x_BTC)
-        x_TC = x_BTC.reshape(-1, self.config.dim)
+            hidden_states_BTC, v_first_BTC = layer(hidden_states_BTC, v_first_BTC)
+        hidden_states_BTC = self.norm(hidden_states_BTC)
+        hidden_states_NC = hidden_states_BTC.reshape(-1, self.config.dim)
         if self._skip_lm_head:
-            return x_TC
-        return self.lm_head(x_TC)
+            return hidden_states_NC
+        return self.lm_head(hidden_states_NC)
 
     def preprocess_inputs(
         self,
@@ -462,20 +482,20 @@ class RWKV7Model(BaseModel):
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
         del parallel_dims, parallelism
         batch = dict(input_dict)
-        tokens_T = batch.pop("input")
-        labels_T = batch.pop("labels")
+        tokens_N = batch.pop("input")
+        labels_N = batch.pop("labels")
         batch.pop("positions", None)
         if batch:
             raise ValueError(
-                f"RWKV7 received unsupported input fields: {sorted(batch)}."
+                f"RWKV-7 received unsupported input fields: {sorted(batch)}."
             )
-        tokens_BT = tokens_T.reshape(-1, self.config.context_length)
-        return tokens_BT, labels_T.reshape(-1), {}
+        tokens_BT = tokens_N.reshape(-1, self.config.context_length)
+        return tokens_BT, labels_N.reshape(-1), {}
 
 
 __all__ = [
-    "RWKV7Block",
-    "RWKV7ChannelMix",
-    "RWKV7Model",
-    "RWKV7TimeMix",
+    "RWKVAttention",
+    "RWKVDecoderLayer",
+    "RWKVFeedForward",
+    "RWKVModel",
 ]

@@ -21,19 +21,19 @@ from torchtitan.experiments.rwkv_state_tuning.artifact import (
     save_state_artifact,
 )
 from torchtitan.experiments.rwkv_state_tuning.checkpoint import (
-    RWKV7StateTuningCheckpointManager,
+    RWKVStateTuningCheckpointManager,
 )
 from torchtitan.models.rwkv7.adapter import (
     load_native_adapter,
     merge_native_adapter,
     native_to_peft,
     peft_to_native,
-    RWKV7_LORA_TARGETS,
+    RWKV_LORA_TARGETS,
     save_native_adapter,
 )
 from torchtitan.models.rwkv7.checkpoint import (
     finalize_hf_artifact,
-    RWKV7CheckpointManager,
+    RWKVCheckpointManager,
 )
 
 
@@ -48,12 +48,12 @@ def _write_base_config(path, *, num_layers=2, hidden_size=4, head_size=2):
     (path / "config.json").write_text(json.dumps(config))
 
 
-def _adapter_tensors(*, num_layers=2, hidden_size=4, rank=2):
+def _make_adapter_tensors(*, num_layers=2, hidden_size=4, rank=2):
     tensors = {}
-    for layer_id in range(num_layers):
-        for target_id, target in enumerate(RWKV7_LORA_TARGETS):
-            prefix = f"layers.{layer_id}.linear_attn.{target}"
-            offset = layer_id * 10 + target_id
+    for layer_idx in range(num_layers):
+        for target_id, target in enumerate(RWKV_LORA_TARGETS):
+            prefix = f"layers.{layer_idx}.linear_attn.{target}"
+            offset = layer_idx * 10 + target_id
             tensors[f"{prefix}.lora_a.weight"] = (
                 torch.arange(rank * hidden_size, dtype=torch.bfloat16).reshape(
                     rank, hidden_size
@@ -75,7 +75,7 @@ def test_native_peft_round_trip(tmp_path):
     peft_path = tmp_path / "peft"
     round_trip_path = tmp_path / "round-trip"
     _write_base_config(base_path)
-    tensors = _adapter_tensors()
+    tensors = _make_adapter_tensors()
     save_native_adapter(native_path, tensors, base_model_path=base_path, alpha=4.0)
     native_config = json.loads((native_path / "adapter_config.json").read_text())
     assert native_config["rank"] == 2
@@ -115,7 +115,7 @@ def test_native_adapter_rejects_invalid_metadata(tmp_path, field, value, message
     _write_base_config(base_path)
     save_native_adapter(
         native_path,
-        _adapter_tensors(),
+        _make_adapter_tensors(),
         base_model_path=base_path,
         alpha=4.0,
     )
@@ -134,7 +134,7 @@ def test_native_adapter_rejects_tensor_dtype_mismatch(tmp_path):
     _write_base_config(base_path)
     save_native_adapter(
         native_path,
-        _adapter_tensors(),
+        _make_adapter_tensors(),
         base_model_path=base_path,
         alpha=4.0,
     )
@@ -160,7 +160,7 @@ def test_peft_load_and_save_round_trip(tmp_path):
     peft_saved_path = tmp_path / "peft-saved"
     round_trip_path = tmp_path / "round-trip"
     _write_base_config(base_path, hidden_size=128, head_size=64)
-    tensors = _adapter_tensors(hidden_size=128)
+    tensors = _make_adapter_tensors(hidden_size=128)
     save_native_adapter(native_path, tensors, base_model_path=base_path, alpha=4.0)
     native_to_peft(native_path, peft_path, base_model_path=base_path)
 
@@ -210,14 +210,14 @@ def test_merge_native_adapter_streams_base_shards(tmp_path):
     native_path = tmp_path / "native"
     merged_path = tmp_path / "merged"
     _write_base_config(base_path)
-    adapter = _adapter_tensors()
+    adapter = _make_adapter_tensors()
     save_native_adapter(native_path, adapter, base_model_path=base_path, alpha=4.0)
 
     base_tensors = {"model.embed_tokens.weight": torch.ones(2, 4)}
-    for layer_id in range(2):
-        for target in RWKV7_LORA_TARGETS:
-            key = f"model.layers.{layer_id}.linear_attn.{target}.weight"
-            base_tensors[key] = torch.full((4, 4), float(layer_id + 1))
+    for layer_idx in range(2):
+        for target in RWKV_LORA_TARGETS:
+            key = f"model.layers.{layer_idx}.linear_attn.{target}.weight"
+            base_tensors[key] = torch.full((4, 4), float(layer_idx + 1))
     save_file(base_tensors, base_path / "model.safetensors")
 
     merge_native_adapter(base_path, native_path, merged_path)
@@ -226,10 +226,10 @@ def test_merge_native_adapter_streams_base_shards(tmp_path):
         merged["model.embed_tokens.weight"],
         base_tensors["model.embed_tokens.weight"],
     )
-    for layer_id in range(2):
-        for target in RWKV7_LORA_TARGETS:
-            base_key = f"model.layers.{layer_id}.linear_attn.{target}.weight"
-            native_prefix = f"layers.{layer_id}.linear_attn.{target}"
+    for layer_idx in range(2):
+        for target in RWKV_LORA_TARGETS:
+            base_key = f"model.layers.{layer_idx}.linear_attn.{target}.weight"
+            native_prefix = f"layers.{layer_idx}.linear_attn.{target}"
             expected = base_tensors[base_key] + 2.0 * (
                 adapter[f"{native_prefix}.lora_b.weight"].float()
                 @ adapter[f"{native_prefix}.lora_a.weight"].float()
@@ -242,14 +242,14 @@ def test_state_tuning_artifact_round_trip(tmp_path):
     artifact_path = tmp_path / "state"
     _write_base_config(base_path, num_layers=2, hidden_size=128, head_size=64)
     states = {}
-    for layer_id in range(2):
-        states[f"layers.{layer_id}.linear_attn.initial_shift"] = torch.zeros(
+    for layer_idx in range(2):
+        states[f"layers.{layer_idx}.linear_attn.initial_attention_shift"] = torch.zeros(
             128, dtype=torch.bfloat16
         )
-        states[f"layers.{layer_id}.linear_attn.initial_wkv_state"] = torch.zeros(
+        states[f"layers.{layer_idx}.linear_attn.initial_wkv_state"] = torch.zeros(
             2, 64, 64, dtype=torch.float32
         )
-        states[f"layers.{layer_id}.mlp.initial_shift"] = torch.zeros(
+        states[f"layers.{layer_idx}.mlp.initial_feed_forward_shift"] = torch.zeros(
             128, dtype=torch.bfloat16
         )
     save_state_artifact(artifact_path, states, base_model_path=base_path)
@@ -264,14 +264,14 @@ def test_state_tuning_artifact_rejects_invalid_metadata(tmp_path):
     artifact_path = tmp_path / "state"
     _write_base_config(base_path, num_layers=2, hidden_size=128, head_size=64)
     states = {}
-    for layer_id in range(2):
-        states[f"layers.{layer_id}.linear_attn.initial_shift"] = torch.zeros(
+    for layer_idx in range(2):
+        states[f"layers.{layer_idx}.linear_attn.initial_attention_shift"] = torch.zeros(
             128, dtype=torch.bfloat16
         )
-        states[f"layers.{layer_id}.linear_attn.initial_wkv_state"] = torch.zeros(
+        states[f"layers.{layer_idx}.linear_attn.initial_wkv_state"] = torch.zeros(
             2, 64, 64, dtype=torch.float32
         )
-        states[f"layers.{layer_id}.mlp.initial_shift"] = torch.zeros(
+        states[f"layers.{layer_idx}.mlp.initial_feed_forward_shift"] = torch.zeros(
             128, dtype=torch.bfloat16
         )
     save_state_artifact(artifact_path, states, base_model_path=base_path)
@@ -308,13 +308,13 @@ def test_from_scratch_parameter_efficient_runs_keep_dcp_without_artifact(caplog)
         initial_load_in_hf=False,
         _adapter_states=lambda: {"adapter": torch.ones(1)},
     )
-    RWKV7CheckpointManager._save_adapter_artifact(adapter_manager, 10)
+    RWKVCheckpointManager._save_adapter_artifact(adapter_manager, 10)
 
     state_manager = SimpleNamespace(
         initial_load_in_hf=False,
         _state_states=lambda: {"state": torch.ones(1)},
     )
-    RWKV7StateTuningCheckpointManager._save_state_artifact(state_manager, 10)
+    RWKVStateTuningCheckpointManager._save_state_artifact(state_manager, 10)
 
     assert "adapter-only artifact" in caplog.text
     assert "state-only artifact" in caplog.text

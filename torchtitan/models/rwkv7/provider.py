@@ -15,9 +15,9 @@ from types import ModuleType
 import torch
 
 
-FLASH_RWKV2_VERSION = "0.1.0a10"
+FLASH_RWKV2_VERSION = "0.1.0a11"
 
-PRETRAIN_TIMEMIX_OPERATORS = (
+PRETRAIN_ATTENTION_OPERATORS = (
     "pretrain_tmix_a_gate_bf16",
     "pretrain_tmix_kk_pre_bf16",
     "pretrain_tmix_readout_bf16",
@@ -25,8 +25,8 @@ PRETRAIN_TIMEMIX_OPERATORS = (
     "pretrain_tmix_vres_gate_bf16",
     "pretrain_tmix_wkv7_recurrent_bf16",
 )
-PRETRAIN_CHANNELMIX_OPERATORS = ("pretrain_cmix_bf16",)
-STATE_TUNING_TIMEMIX_OPERATORS = (
+PRETRAIN_FEED_FORWARD_OPERATORS = ("pretrain_cmix_bf16",)
+STATE_TUNING_ATTENTION_OPERATORS = (
     "pretrain_tmix_a_gate_bf16",
     "pretrain_tmix_kk_pre_bf16",
     "pretrain_tmix_readout_bf16",
@@ -34,7 +34,7 @@ STATE_TUNING_TIMEMIX_OPERATORS = (
     "statetune_tmix_tokenshift_bf16",
     "statetune_tmix_wkv7_recurrent_fp32io16",
 )
-STATE_TUNING_CHANNELMIX_OPERATORS = ("statetune_cmix_bf16",)
+STATE_TUNING_FEED_FORWARD_OPERATORS = ("statetune_cmix_bf16",)
 
 
 @lru_cache(maxsize=None)
@@ -46,7 +46,7 @@ def _load_and_validate(
         module = importlib.import_module("flashrwkv2")
     except ImportError as error:
         raise RuntimeError(
-            f"RWKV7 {mode} requires FlashRWKV2=={FLASH_RWKV2_VERSION}; "
+            f"RWKV-7 {mode} requires FlashRWKV2=={FLASH_RWKV2_VERSION}; "
             f"import failed: {error}"
         ) from error
 
@@ -54,14 +54,14 @@ def _load_and_validate(
     source = getattr(module, "__file__", "unknown")
     if version != FLASH_RWKV2_VERSION:
         raise RuntimeError(
-            f"RWKV7 {mode} requires FlashRWKV2=={FLASH_RWKV2_VERSION}; "
+            f"RWKV-7 {mode} requires FlashRWKV2=={FLASH_RWKV2_VERSION}; "
             f"installed version={version}, source={source}."
         )
 
     missing = [name for name in operators if not callable(getattr(module, name, None))]
     if missing:
         raise RuntimeError(
-            f"RWKV7 {mode} requires FlashRWKV2 public operators {missing}; "
+            f"RWKV-7 {mode} requires FlashRWKV2 public operators {missing}; "
             f"installed version={version}, source={source}."
         )
     return module
@@ -77,11 +77,11 @@ def load_flash_rwkv2(
     """Load the pinned provider after validating the execution boundary."""
     if not tensor.is_cuda:
         raise RuntimeError(
-            f"RWKV7 {mode} requires CUDA tensors; got device={tensor.device}, "
+            f"RWKV-7 {mode} requires CUDA tensors; got device={tensor.device}, "
             f"dtype={tensor.dtype}, shape={tuple(tensor.shape)}."
         )
     if tensor.dtype != torch.bfloat16:
-        raise TypeError(f"RWKV7 {mode} requires bfloat16 tensors, got {tensor.dtype}.")
+        raise TypeError(f"RWKV-7 {mode} requires bfloat16 tensors, got {tensor.dtype}.")
     return preloaded if preloaded is not None else _load_and_validate(operators, mode)
 
 
@@ -95,10 +95,10 @@ def preload_flash_rwkv2(
 
 __all__ = [
     "FLASH_RWKV2_VERSION",
-    "PRETRAIN_CHANNELMIX_OPERATORS",
-    "PRETRAIN_TIMEMIX_OPERATORS",
-    "STATE_TUNING_CHANNELMIX_OPERATORS",
-    "STATE_TUNING_TIMEMIX_OPERATORS",
+    "PRETRAIN_ATTENTION_OPERATORS",
+    "PRETRAIN_FEED_FORWARD_OPERATORS",
+    "STATE_TUNING_ATTENTION_OPERATORS",
+    "STATE_TUNING_FEED_FORWARD_OPERATORS",
     "load_flash_rwkv2",
     "preload_flash_rwkv2",
 ]

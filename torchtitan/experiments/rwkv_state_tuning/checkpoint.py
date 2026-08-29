@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""DCP and release-artifact handling for RWKV7 State Tuning."""
+"""DCP and release-artifact handling for RWKV-7 State Tuning."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from torch.distributed.checkpoint import (
 from torchtitan.components.checkpointer.base import MODEL
 from torchtitan.models.rwkv7.checkpoint import (
     finalize_hf_artifact,
-    RWKV7CheckpointManager,
+    RWKVCheckpointManager,
 )
 from torchtitan.tools.logging import logger
 
@@ -35,16 +35,16 @@ from .artifact import (
 )
 
 
-class RWKV7StateTuningCheckpointManager(RWKV7CheckpointManager):
+class RWKVStateTuningCheckpointManager(RWKVCheckpointManager):
     """Add native initial-state loading and final state-only artifacts."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(RWKV7CheckpointManager.Config):
+    class Config(RWKVCheckpointManager.Config):
         initial_load_state_path: Annotated[str, tyro.conf.Suppress] = ""
         state_artifact_folder: Annotated[str, tyro.conf.Suppress] = "state"
 
         def __post_init__(self) -> None:
-            RWKV7CheckpointManager.Config.__post_init__(self)
+            RWKVCheckpointManager.Config.__post_init__(self)
             if not self.state_artifact_folder:
                 raise ValueError("state_artifact_folder must not be empty.")
 
@@ -93,7 +93,7 @@ class RWKV7StateTuningCheckpointManager(RWKV7CheckpointManager):
             return
         if not self.initial_load_in_hf:
             logger.warning(
-                "Skipping the RWKV7 state-only artifact because this run did not "
+                "Skipping the RWKV-7 state-only artifact because this run did not "
                 "load an HF base model; the full DCP checkpoint remains saved."
             )
             return
@@ -126,4 +126,4 @@ class RWKV7StateTuningCheckpointManager(RWKV7CheckpointManager):
         self._save_state_artifact(curr_step)
 
 
-__all__ = ["RWKV7StateTuningCheckpointManager"]
+__all__ = ["RWKVStateTuningCheckpointManager"]

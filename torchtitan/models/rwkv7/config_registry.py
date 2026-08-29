@@ -4,9 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Training recipes for RWKV7 pretraining, full SFT, and LoRA SFT."""
+"""Training recipes for RWKV-7 pretraining, full SFT, and LoRA SFT."""
 
 from __future__ import annotations
+
+from typing import cast
 
 from torchtitan.components.data import (
     ConcatThenSplitPackingConfig,
@@ -22,93 +24,61 @@ from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.hf_datasets.text_datasets import ChatProcessor, DATASETS
-from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.trainer import Trainer
 
 from . import model_registry
-from .adapter import RWKV7_LORA_TARGETS
-from .checkpoint import RWKV7CheckpointManager
+from .adapter import RWKV_LORA_TARGETS
+from .checkpoint import RWKVCheckpointManager
+from .model import RWKVModel
 
 
-def _sft_messages(sample):
-    return [
-        {"role": "user", "content": sample["question"]},
-        {"role": "assistant", "content": sample["answer"]},
-    ]
-
-
-def _loss(model_spec) -> ChunkedLossWrapper.Config:
-    return ChunkedLossWrapper.Config(
-        loss_fn=CrossEntropyLoss.Config(
-            global_vocab_size=model_spec.model.vocab_size,
-        ),
-    )
-
-
-def _pretrain_config(
-    flavor: str,
-    *,
-    max_context_length: int,
-    num_tokens_per_microbatch: int,
-    hf_assets_path: str,
-) -> Trainer.Config:
-    model_spec = model_registry(flavor)
+def rwkv7_debugmodel() -> Trainer.Config:
+    model_spec = model_registry("debugmodel")
     return Trainer.Config(
-        loss=_loss(model_spec),
-        hf_assets_path=hf_assets_path,
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=cast(RWKVModel.Config, model_spec.model).vocab_size,
+            ),
+        ),
+        hf_assets_path="./tests/assets/tokenizer",
         model_spec=model_spec,
         optimizer=default_adamw(lr=3e-4),
-        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=20),
+        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=2),
         training=TrainingConfig(
-            num_tokens_per_microbatch_per_dp_rank=num_tokens_per_microbatch,
-            max_context_length=max_context_length,
-            steps=1000,
+            num_tokens_per_microbatch_per_dp_rank=2 * 128,
+            max_context_length=128,
+            steps=10,
             dtype="bfloat16",
         ),
         dataloader=GrainDataLoader.Config(
-            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4"]),
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
+            shuffle=False,
         ),
-        metrics=MetricsProcessor.Config(enable_tensorboard=True),
+        metrics=MetricsProcessor.Config(log_freq=1, enable_tensorboard=True),
         parallelism=ParallelismConfig(data_parallel_shard_degree=-1),
-        checkpoint=RWKV7CheckpointManager.Config(interval=500),
+        checkpoint=RWKVCheckpointManager.Config(interval=10),
         activation_checkpoint=SelectiveAC.Config(),
         compile=CompileConfig(enable=True),
     )
 
 
-def _sft_config(
-    flavor: str,
-    *,
-    hf_assets_path: str,
-    lora: bool,
-    load_base: bool,
-) -> Trainer.Config:
-    converters: list[ModelConfigConverter.Config] | None = None
-    if lora:
-        converters = [
-            LoRAConverter.Config(
-                rank=8,
-                alpha=16.0,
-                target_modules=list(RWKV7_LORA_TARGETS),
-            )
+def sft_debugmodel() -> Trainer.Config:
+    def process_sample(sample):
+        return [
+            {"role": "user", "content": sample["question"]},
+            {"role": "assistant", "content": sample["answer"]},
         ]
-    model_spec = model_registry(flavor, converters=converters)
-    dataset = SingleDatasetConfig(
-        source=HuggingFaceRandomAccessSource.Config(
-            path="json",
-            split="train",
-            load_dataset_kwargs={
-                "data_files": "tests/assets/sft_test/data.json",
-            },
-        ),
-        processor=ChatProcessor.Config(messages_fn=_sft_messages),
-        post_filters=(lambda sample: sample is not None,),
-    )
+
+    model_spec = model_registry("debugmodel")
     return Trainer.Config(
-        loss=_loss(model_spec),
-        hf_assets_path=hf_assets_path,
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=cast(RWKVModel.Config, model_spec.model).vocab_size,
+            ),
+        ),
+        hf_assets_path="./tests/assets/tokenizer",
         model_spec=model_spec,
-        optimizer=default_adamw(lr=8e-4 if lora else 3e-4),
+        optimizer=default_adamw(lr=3e-4),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,
@@ -122,128 +92,130 @@ def _sft_config(
             dtype="bfloat16",
         ),
         dataloader=GrainDataLoader.Config(
-            dataset=dataset,
+            dataset=SingleDatasetConfig(
+                source=HuggingFaceRandomAccessSource.Config(
+                    path="json",
+                    split="train",
+                    load_dataset_kwargs={
+                        "data_files": "tests/assets/sft_test/data.json",
+                    },
+                ),
+                processor=ChatProcessor.Config(messages_fn=process_sample),
+                post_filters=(lambda sample: sample is not None,),
+            ),
             collator=FixedRowTextCollator.Config(),
         ),
-        metrics=MetricsProcessor.Config(
-            log_freq=1,
-            enable_tensorboard=True,
-        ),
+        metrics=MetricsProcessor.Config(log_freq=1, enable_tensorboard=True),
         parallelism=ParallelismConfig(data_parallel_shard_degree=-1),
-        checkpoint=RWKV7CheckpointManager.Config(
+        checkpoint=RWKVCheckpointManager.Config(
             interval=5,
             last_save_model_only=False,
-            initial_load_model_only=load_base,
-            initial_load_in_hf=load_base,
         ),
         activation_checkpoint=SelectiveAC.Config(),
         compile=CompileConfig(enable=True),
     )
 
 
-def rwkv7_debugmodel() -> Trainer.Config:
-    config = _pretrain_config(
+def sft_debugmodel_lora() -> Trainer.Config:
+    config = sft_debugmodel()
+    config.model_spec = model_registry(
         "debugmodel",
-        max_context_length=128,
-        num_tokens_per_microbatch=2 * 128,
-        hf_assets_path="./tests/assets/tokenizer",
+        converters=[
+            LoRAConverter.Config(
+                rank=8,
+                alpha=16.0,
+                target_modules=list(RWKV_LORA_TARGETS),
+            )
+        ],
     )
-    config.training.steps = 10
-    config.lr_scheduler.warmup_steps = 2
-    config.dataloader = GrainDataLoader.Config(
-        dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4_test"]),
-        shuffle=False,
-    )
-    config.metrics.log_freq = 1
-    config.checkpoint.interval = 10
+    config.optimizer = default_adamw(lr=8e-4)
     return config
 
 
-def rwkv7_debugmodel_sft() -> Trainer.Config:
-    return _sft_config(
-        "debugmodel",
-        hf_assets_path="./tests/assets/tokenizer",
-        lora=False,
-        load_base=False,
-    )
-
-
-def rwkv7_debugmodel_lora_sft() -> Trainer.Config:
-    return _sft_config(
-        "debugmodel",
-        hf_assets_path="./tests/assets/tokenizer",
-        lora=True,
-        load_base=False,
-    )
-
-
 def rwkv7_0_1b() -> Trainer.Config:
-    return _pretrain_config(
-        "0.1b",
-        max_context_length=4096,
-        num_tokens_per_microbatch=4096,
+    model_spec = model_registry("0.1b")
+    return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=cast(RWKVModel.Config, model_spec.model).vocab_size,
+            ),
+        ),
         hf_assets_path="./assets/hf/rwkv7-0.1b",
+        model_spec=model_spec,
+        optimizer=default_adamw(lr=3e-4),
+        lr_scheduler=LRSchedulersContainer.Config(warmup_steps=20),
+        training=TrainingConfig(
+            num_tokens_per_microbatch_per_dp_rank=4096,
+            max_context_length=4096,
+            steps=1000,
+            dtype="bfloat16",
+        ),
+        dataloader=GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(dataset=DATASETS["c4"]),
+        ),
+        metrics=MetricsProcessor.Config(enable_tensorboard=True),
+        parallelism=ParallelismConfig(data_parallel_shard_degree=-1),
+        checkpoint=RWKVCheckpointManager.Config(interval=500),
+        activation_checkpoint=SelectiveAC.Config(),
+        compile=CompileConfig(enable=True),
     )
 
 
 def rwkv7_0_4b() -> Trainer.Config:
-    return _pretrain_config(
-        "0.4b",
-        max_context_length=4096,
-        num_tokens_per_microbatch=4096,
-        hf_assets_path="./assets/hf/rwkv7-0.4b",
-    )
+    config = rwkv7_0_1b()
+    config.model_spec = model_registry("0.4b")
+    config.hf_assets_path = "./assets/hf/rwkv7-0.4b"
+    return config
 
 
 def rwkv7_1_5b() -> Trainer.Config:
-    return _pretrain_config(
-        "1.5b",
-        max_context_length=4096,
-        num_tokens_per_microbatch=4096,
-        hf_assets_path="./assets/hf/rwkv7-1.5b",
-    )
+    config = rwkv7_0_1b()
+    config.model_spec = model_registry("1.5b")
+    config.hf_assets_path = "./assets/hf/rwkv7-1.5b"
+    return config
 
 
 def rwkv7_2_9b() -> Trainer.Config:
-    return _pretrain_config(
-        "2.9b",
-        max_context_length=4096,
-        num_tokens_per_microbatch=4096,
-        hf_assets_path="./assets/hf/rwkv7-2.9b",
-    )
+    config = rwkv7_0_1b()
+    config.model_spec = model_registry("2.9b")
+    config.hf_assets_path = "./assets/hf/rwkv7-2.9b"
+    return config
 
 
 def rwkv7_7_2b() -> Trainer.Config:
-    return _pretrain_config(
-        "7.2b",
-        max_context_length=4096,
-        num_tokens_per_microbatch=4096,
-        hf_assets_path="./assets/hf/rwkv7-7.2b",
-    )
+    config = rwkv7_0_1b()
+    config.model_spec = model_registry("7.2b")
+    config.hf_assets_path = "./assets/hf/rwkv7-7.2b"
+    return config
 
 
 def rwkv7_13_3b() -> Trainer.Config:
-    return _pretrain_config(
-        "13.3b",
-        max_context_length=4096,
-        num_tokens_per_microbatch=4096,
-        hf_assets_path="./assets/hf/rwkv7-13.3b",
-    )
+    config = rwkv7_0_1b()
+    config.model_spec = model_registry("13.3b")
+    config.hf_assets_path = "./assets/hf/rwkv7-13.3b"
+    return config
 
 
-def rwkv7_1_5b_sft() -> Trainer.Config:
-    return _sft_config(
+def sft_rwkv_1_5b() -> Trainer.Config:
+    config = sft_debugmodel()
+    config.model_spec = model_registry("1.5b")
+    config.hf_assets_path = "./assets/hf/rwkv7-1.5b"
+    config.checkpoint.initial_load_model_only = True
+    config.checkpoint.initial_load_in_hf = True
+    return config
+
+
+def sft_rwkv_1_5b_lora() -> Trainer.Config:
+    config = sft_rwkv_1_5b()
+    config.model_spec = model_registry(
         "1.5b",
-        hf_assets_path="./assets/hf/rwkv7-1.5b",
-        lora=False,
-        load_base=True,
+        converters=[
+            LoRAConverter.Config(
+                rank=8,
+                alpha=16.0,
+                target_modules=list(RWKV_LORA_TARGETS),
+            )
+        ],
     )
-
-
-def rwkv7_1_5b_lora_sft() -> Trainer.Config:
-    return _sft_config(
-        "1.5b",
-        hf_assets_path="./assets/hf/rwkv7-1.5b",
-        lora=True,
-        load_base=True,
-    )
+    config.optimizer = default_adamw(lr=8e-4)
+    return config

@@ -23,23 +23,34 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import ParallelismConfig
 from torchtitan.experiments.rwkv_state_tuning import (
     parallelize as state_parallelize,
-    RWKV7StateTuningConverter,
+    RWKVStateTuningAttention,
+    RWKVStateTuningConverter,
+    RWKVStateTuningFeedForward,
+    RWKVStateTuningModel,
 )
 from torchtitan.experiments.rwkv_state_tuning.config_registry import (
-    rwkv7_debugmodel_state_tuning,
+    state_tuning_debugmodel,
 )
 from torchtitan.hf_datasets.text_datasets import ChatProcessor
-from torchtitan.models.rwkv7 import model as rwkv7_model, model_registry, rwkv7_configs
-from torchtitan.models.rwkv7.adapter import adapter_state_dict, RWKV7_LORA_TARGETS
-from torchtitan.models.rwkv7.checkpoint import RWKV7CheckpointManager
+from torchtitan.models.rwkv7 import (
+    model as rwkv7_model,
+    model_registry,
+    rwkv_configs,
+    RWKVAttention,
+    RWKVDecoderLayer,
+    RWKVFeedForward,
+    RWKVModel,
+)
+from torchtitan.models.rwkv7.adapter import adapter_state_dict, RWKV_LORA_TARGETS
+from torchtitan.models.rwkv7.checkpoint import RWKVCheckpointManager
 from torchtitan.models.rwkv7.provider import (
     load_flash_rwkv2,
-    PRETRAIN_CHANNELMIX_OPERATORS,
-    PRETRAIN_TIMEMIX_OPERATORS,
-    STATE_TUNING_CHANNELMIX_OPERATORS,
-    STATE_TUNING_TIMEMIX_OPERATORS,
+    PRETRAIN_ATTENTION_OPERATORS,
+    PRETRAIN_FEED_FORWARD_OPERATORS,
+    STATE_TUNING_ATTENTION_OPERATORS,
+    STATE_TUNING_FEED_FORWARD_OPERATORS,
 )
-from torchtitan.models.rwkv7.state_dict_adapter import RWKV7StateDictAdapter
+from torchtitan.models.rwkv7.state_dict_adapter import RWKVStateDictAdapter
 from torchtitan.tools.utils import set_default_dtype
 
 
@@ -65,7 +76,7 @@ def test_rwkv7_flavor_contract(flavor):
         gate_rank,
         num_params,
     ) = FLAVORS[flavor]
-    config = rwkv7_configs[flavor]()
+    config = rwkv_configs[flavor]()
     assert config.architecture_version == "rwkv7"
     assert config.vocab_size == 65536
     assert config.num_layers == num_layers
@@ -81,6 +92,13 @@ def test_rwkv7_flavor_contract(flavor):
 
     with torch.device("meta"):
         model = config.build()
+    assert isinstance(model, RWKVModel)
+    assert all(isinstance(layer, RWKVDecoderLayer) for layer in model.layers.values())
+    assert all(
+        isinstance(layer.linear_attn, RWKVAttention)
+        and isinstance(layer.mlp, RWKVFeedForward)
+        for layer in model.layers.values()
+    )
     assert sum(parameter.numel() for parameter in model.parameters()) == num_params
 
 
@@ -108,7 +126,7 @@ def test_rwkv7_bfloat16_materialization_initializes_orthogonal_weights():
 
 
 def test_rwkv7_runtime_config_boundaries():
-    model_config = rwkv7_configs["debugmodel"]()
+    model_config = rwkv_configs["debugmodel"]()
     training = SimpleNamespace(
         dtype="bfloat16",
         max_context_length=127,
@@ -144,13 +162,13 @@ def test_rwkv7_has_no_cpu_provider_fallback():
     [
         (
             None,
-            (PRETRAIN_TIMEMIX_OPERATORS, PRETRAIN_CHANNELMIX_OPERATORS),
+            (PRETRAIN_ATTENTION_OPERATORS, PRETRAIN_FEED_FORWARD_OPERATORS),
         ),
         (
-            [RWKV7StateTuningConverter.Config()],
+            [RWKVStateTuningConverter.Config()],
             (
-                STATE_TUNING_TIMEMIX_OPERATORS,
-                STATE_TUNING_CHANNELMIX_OPERATORS,
+                STATE_TUNING_ATTENTION_OPERATORS,
+                STATE_TUNING_FEED_FORWARD_OPERATORS,
             ),
         ),
     ],
@@ -203,11 +221,11 @@ def test_preloaded_provider_supports_fullgraph_compile():
 
 
 def test_rwkv7_state_dict_mapping_covers_every_base_parameter():
-    config = rwkv7_configs["debugmodel"]()
+    config = rwkv_configs["debugmodel"]()
     with torch.device("meta"):
         model = config.build()
     state_dict = model.state_dict()
-    adapter = RWKV7StateDictAdapter(config, None)
+    adapter = RWKVStateDictAdapter(config, None)
     hf_state_dict = adapter.to_hf(state_dict)
     round_trip = adapter.from_hf(hf_state_dict)
     assert set(round_trip) == set(state_dict)
@@ -216,14 +234,14 @@ def test_rwkv7_state_dict_mapping_covers_every_base_parameter():
 
 
 def test_rwkv7_state_dict_adapter_ignores_state_tuning_parameters():
-    config = rwkv7_configs["debugmodel"]()
+    config = rwkv_configs["debugmodel"]()
     spec = model_registry(
         "debugmodel",
-        converters=[RWKV7StateTuningConverter.Config()],
+        converters=[RWKVStateTuningConverter.Config()],
     )
     with torch.device("meta"):
         state_dict = spec.model.build().state_dict()
-    adapter = RWKV7StateDictAdapter(config, None)
+    adapter = RWKVStateDictAdapter(config, None)
     hf_state_dict = adapter.to_hf(state_dict)
 
     assert set(adapter.from_hf(hf_state_dict)) == set(config.build().state_dict())
@@ -236,7 +254,7 @@ def test_rwkv7_lora_targets_and_initialization():
             LoRAConverter.Config(
                 rank=8,
                 alpha=16.0,
-                target_modules=list(RWKV7_LORA_TARGETS),
+                target_modules=list(RWKV_LORA_TARGETS),
             )
         ],
     )
@@ -248,9 +266,9 @@ def test_rwkv7_lora_targets_and_initialization():
         if parameter.requires_grad
     )
     assert len(trainable) == 2 * 4 * 2
-    for layer_id in range(2):
-        for target in RWKV7_LORA_TARGETS:
-            prefix = f"layers.{layer_id}.linear_attn.{target}"
+    for layer_idx in range(2):
+        for target in RWKV_LORA_TARGETS:
+            prefix = f"layers.{layer_idx}.linear_attn.{target}"
             adapter_a = trainable[f"{prefix}.lora_a.weight"]
             adapter_b = trainable[f"{prefix}.lora_b.weight"]
             assert adapter_a.shape == (8, 128)
@@ -262,7 +280,7 @@ def test_rwkv7_lora_targets_and_initialization():
         for name, parameter in model.named_parameters()
     )
 
-    manager = object.__new__(RWKV7CheckpointManager)
+    manager = object.__new__(RWKVCheckpointManager)
     manager.states = {MODEL: SimpleNamespace(model=[model])}
     states = adapter_state_dict(model.state_dict())
     assert manager._adapter_alpha(states) == 16.0
@@ -271,9 +289,15 @@ def test_rwkv7_lora_targets_and_initialization():
 def test_rwkv7_state_tuning_trainable_parameter_set():
     spec = model_registry(
         "debugmodel",
-        converters=[RWKV7StateTuningConverter.Config()],
+        converters=[RWKVStateTuningConverter.Config()],
     )
     model = spec.model.build()
+    assert isinstance(model, RWKVStateTuningModel)
+    assert all(
+        isinstance(layer.linear_attn, RWKVStateTuningAttention)
+        and isinstance(layer.mlp, RWKVStateTuningFeedForward)
+        for layer in model.layers.values()
+    )
     model.init_states()
     trainable = {
         name: parameter
@@ -281,12 +305,12 @@ def test_rwkv7_state_tuning_trainable_parameter_set():
         if parameter.requires_grad
     }
     assert set(trainable) == {
-        "layers.0.linear_attn.initial_shift",
+        "layers.0.linear_attn.initial_attention_shift",
         "layers.0.linear_attn._wkv_state.initial_wkv_state",
-        "layers.0.mlp.initial_shift",
-        "layers.1.linear_attn.initial_shift",
+        "layers.0.mlp.initial_feed_forward_shift",
+        "layers.1.linear_attn.initial_attention_shift",
         "layers.1.linear_attn._wkv_state.initial_wkv_state",
-        "layers.1.mlp.initial_shift",
+        "layers.1.mlp.initial_feed_forward_shift",
     }
     for name, parameter in trainable.items():
         if name.endswith("initial_wkv_state"):
@@ -298,7 +322,7 @@ def test_rwkv7_state_tuning_trainable_parameter_set():
 
     state_dict = model.state_dict()
     canonical_wkv_keys = {
-        f"layers.{layer_id}.linear_attn.initial_wkv_state" for layer_id in range(2)
+        f"layers.{layer_idx}.linear_attn.initial_wkv_state" for layer_idx in range(2)
     }
     assert canonical_wkv_keys <= set(state_dict)
     assert not any("._wkv_state." in key for key in state_dict)
@@ -316,31 +340,32 @@ def test_rwkv7_state_tuning_trainable_parameter_set():
     "converters",
     [
         [
-            LoRAConverter.Config(target_modules=list(RWKV7_LORA_TARGETS)),
-            RWKV7StateTuningConverter.Config(),
+            LoRAConverter.Config(target_modules=list(RWKV_LORA_TARGETS)),
+            RWKVStateTuningConverter.Config(),
         ],
         [
-            RWKV7StateTuningConverter.Config(),
-            LoRAConverter.Config(target_modules=list(RWKV7_LORA_TARGETS)),
+            RWKVStateTuningConverter.Config(),
+            LoRAConverter.Config(target_modules=list(RWKV_LORA_TARGETS)),
         ],
     ],
 )
 def test_rwkv7_state_tuning_rejects_lora(converters):
     with pytest.raises(ValueError, match="cannot be combined"):
-        model_registry("debugmodel", converters=converters)
+        with torch.device("meta"):
+            model_registry("debugmodel", converters=converters).model.build()
 
 
 def test_rwkv7_state_tuning_preserves_fp32_wkv_state_under_fsdp(monkeypatch):
     model_spec = model_registry(
         "debugmodel",
-        converters=[RWKV7StateTuningConverter.Config()],
+        converters=[RWKVStateTuningConverter.Config()],
     )
     model = model_spec.model.build()
     sharded = []
 
     monkeypatch.setattr(
         state_parallelize,
-        "prepare_rwkv7_for_fsdp",
+        "resolve_fsdp_mesh",
         lambda *args, **kwargs: (object(), None),
     )
 
@@ -351,18 +376,24 @@ def test_rwkv7_state_tuning_preserves_fp32_wkv_state_under_fsdp(monkeypatch):
     monkeypatch.setattr(state_parallelize, "fully_shard", record_fully_shard)
     monkeypatch.setattr(
         state_parallelize,
-        "apply_rwkv7_fsdp",
+        "apply_fsdp_to_decoder",
         lambda model, *args, **kwargs: model,
     )
     parallelism = SimpleNamespace(
+        spmd_backend="spmd_types",
         fsdp_reshard_after_forward="default",
+        enable_fsdp_symm_mem=False,
     )
-    result = state_parallelize.parallelize_rwkv7_state_tuning(
+    result = state_parallelize.parallelize_rwkv_state_tuning(
         model,
-        parallel_dims=SimpleNamespace(),
-        training=SimpleNamespace(enable_cpu_offload=False),
+        parallel_dims=SimpleNamespace(tp=1, pp=1, cp=1, ep=1),
+        training=SimpleNamespace(
+            enable_cpu_offload=False,
+            mixed_precision_param="bfloat16",
+            mixed_precision_reduce="float32",
+        ),
         parallelism=parallelism,
-        compile_config=SimpleNamespace(),
+        compile_config=SimpleNamespace(enable=False, components=[]),
         ac_config=None,
         dump_folder=".",
     )
@@ -377,10 +408,10 @@ def test_rwkv7_state_tuning_preserves_fp32_wkv_state_under_fsdp(monkeypatch):
 
 
 def test_rwkv7_state_tuning_recipe_uses_fp32_aware_parallelism():
-    config = rwkv7_debugmodel_state_tuning()
+    config = state_tuning_debugmodel()
     assert (
         config.model_spec.parallelize_fn
-        is state_parallelize.parallelize_rwkv7_state_tuning
+        is state_parallelize.parallelize_rwkv_state_tuning
     )
 
 
@@ -417,7 +448,7 @@ def test_fixed_row_text_collator_keeps_lanes_independent():
     ]
 
 
-def _messages(sample):
+def question_answer_to_messages(sample):
     return [
         {"role": "user", "content": sample["question"]},
         {"role": "assistant", "content": sample["answer"]},
@@ -434,7 +465,7 @@ def _build_fixed_row_dataloader():
                     "data_files": "tests/assets/sft_test/data.json",
                 },
             ),
-            processor=ChatProcessor.Config(messages_fn=_messages),
+            processor=ChatProcessor.Config(messages_fn=question_answer_to_messages),
             post_filters=(lambda sample: sample is not None,),
         ),
         collator=FixedRowTextCollator.Config(),
