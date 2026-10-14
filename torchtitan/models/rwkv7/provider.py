@@ -15,7 +15,7 @@ from types import ModuleType
 import torch
 
 
-FLASH_RWKV2_VERSION = "0.1.0a11"
+FLASH_RWKV2_VERSION = "0.1.0a14"
 
 PRETRAIN_ATTENTION_OPERATORS = (
     "pretrain_tmix_a_gate_bf16",
