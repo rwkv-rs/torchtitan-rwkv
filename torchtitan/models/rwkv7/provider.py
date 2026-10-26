@@ -15,7 +15,7 @@ from types import ModuleType
 import torch
 
 
-FLASH_RWKV2_VERSION = "0.1.0a14"
+FLASH_RWKV2_VERSION = "0.1.0a17"
 
 PRETRAIN_ATTENTION_OPERATORS = (
     "pretrain_tmix_a_gate_bf16",
@@ -31,6 +31,7 @@ STATE_TUNING_ATTENTION_OPERATORS = (
     "pretrain_tmix_kk_pre_bf16",
     "pretrain_tmix_readout_bf16",
     "pretrain_tmix_vres_gate_bf16",
+    "prepare_tmix_wkv7_statetune_metadata",
     "statetune_tmix_tokenshift_bf16",
     "statetune_tmix_wkv7_recurrent_fp32io16",
 )

@@ -19,6 +19,24 @@ def build_model_tests_list() -> list[OverrideDefinitions]:
     """
     return [
         OverrideDefinitions(
+            configs=[recipes.rwkv7_debugmodel_fsdp2_compile],
+            test_descr="RWKV-7 FSDP+compile+CUDA Graph training preparation",
+            test_name="rwkv7_fsdp+compile",
+            ngpu=2,
+            skip_rocm_test=True,
+            use_real_pg=True,
+            timeout=1800,
+        ),
+        OverrideDefinitions(
+            configs=[recipes.rwkv7_state_tuning_debugmodel_fsdp2_compile],
+            test_descr="RWKV-7 FP32 State Tuning FSDP+compile+CUDA Graph",
+            test_name="rwkv7_state_tuning_fsdp+compile",
+            ngpu=2,
+            skip_rocm_test=True,
+            use_real_pg=True,
+            timeout=1800,
+        ),
+        OverrideDefinitions(
             configs=[recipes.llama3_debugmodel_fsdp2_tp2_cp2],
             test_descr="Llama 3 FSDP+TP+CP",
             test_name="llama3_fsdp+tp+cp",

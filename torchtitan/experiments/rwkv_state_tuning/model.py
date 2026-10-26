@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 from torch import nn
@@ -20,6 +20,7 @@ from torchtitan.models.rwkv7.model import RWKVAttention, RWKVFeedForward, RWKVMo
 from torchtitan.models.rwkv7.provider import (
     STATE_TUNING_ATTENTION_OPERATORS,
     STATE_TUNING_FEED_FORWARD_OPERATORS,
+    preload_flash_rwkv2,
 )
 from torchtitan.protocols.module import Module
 
@@ -126,10 +127,10 @@ class RWKVStateTuningAttention(RWKVAttention):
         v_first_BTC: torch.Tensor | None = None,
         attention_shift_BC: torch.Tensor | None = None,
         wkv_state_BHKK: torch.Tensor | None = None,
-        training_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        training_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]
         | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        del attention_shift_BC, wkv_state_BHKK, training_metadata
+        del attention_shift_BC, wkv_state_BHKK
         batch_size, sequence_length, _ = hidden_states_BTC.shape
         attention_shift_BC = (
             self.initial_attention_shift.unsqueeze(0)
@@ -137,25 +138,23 @@ class RWKVStateTuningAttention(RWKVAttention):
             .contiguous()
         )
         wkv_state_BHKK = self._wkv_state(batch_size)
-        (
-            sequence_chunk_offsets_P,
-            chunk_token_starts_R,
-            chunk_token_ends_R,
-        ) = self.training_metadata(
-            batch_size,
-            sequence_length,
-            hidden_states_BTC.device,
-        )
+        if training_metadata is None:
+            offsets = self.training_metadata(
+                batch_size, sequence_length, hidden_states_BTC.device
+            )
+            provider = preload_flash_rwkv2(
+                ("prepare_tmix_wkv7_statetune_metadata",), "state tuning metadata"
+            )
+            prepared_metadata = provider.prepare_tmix_wkv7_statetune_metadata(
+                *offsets, total_tokens=batch_size * sequence_length
+            )
+            training_metadata = (*offsets, prepared_metadata)
         return super().forward(
             hidden_states_BTC,
             v_first_BTC,
             attention_shift_BC,
             wkv_state_BHKK,
-            (
-                sequence_chunk_offsets_P,
-                chunk_token_starts_R,
-                chunk_token_ends_R,
-            ),
+            training_metadata,
         )
 
 
@@ -198,6 +197,10 @@ class RWKVStateTuningModel(RWKVModel):
 
     def __init__(self, config: Config):
         super().__init__(config)
+        self._training_metadata_key: tuple[int, int, torch.device] | None = None
+        self._training_metadata: (
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any] | None
+        ) = None
         if any(isinstance(module, _get_lora_cls(Linear)) for module in self.modules()):
             raise ValueError("RWKV-7 State Tuning and LoRA cannot be combined.")
         self.requires_grad_(False)
@@ -207,6 +210,25 @@ class RWKVStateTuningModel(RWKVModel):
                 module.initial_wkv_state.requires_grad_(True)
             elif isinstance(module, RWKVStateTuningFeedForward):
                 module.initial_feed_forward_shift.requires_grad_(True)
+
+    def preprocess_inputs(self, input_dict, *, parallel_dims, parallelism):
+        tokens_BT, labels_N, extra_kwargs = super().preprocess_inputs(
+            input_dict, parallel_dims=parallel_dims, parallelism=parallelism
+        )
+        batch_size, sequence_length = tokens_BT.shape
+        key = (batch_size, sequence_length, tokens_BT.device)
+        if key != self._training_metadata_key:
+            offsets = RWKVStateTuningAttention.training_metadata(*key)
+            provider = preload_flash_rwkv2(
+                ("prepare_tmix_wkv7_statetune_metadata",), "state tuning metadata"
+            )
+            prepared_metadata = provider.prepare_tmix_wkv7_statetune_metadata(
+                *offsets, total_tokens=batch_size * sequence_length
+            )
+            self._training_metadata = (*offsets, prepared_metadata)
+            self._training_metadata_key = key
+        extra_kwargs["training_metadata"] = self._training_metadata
+        return tokens_BT, labels_N, extra_kwargs
 
 
 __all__ = [

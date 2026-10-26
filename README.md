@@ -55,6 +55,38 @@ We look forward to your contributions!
 | CPU | - | [![CPU Unit Test](https://github.com/pytorch/torchtitan/actions/workflows/unit_test_cpu.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/unit_test_cpu.yaml?query=branch%3Amain) |
 | NVIDIA GPU | [![Integration Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test.yaml?query=branch%3Amain) [![H100 Tests](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_h100.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/integration_test_h100.yaml?query=branch%3Amain) | [![GPU Unit Tests](https://github.com/pytorch/torchtitan/actions/workflows/unit_test_gpu.yaml/badge.svg?branch=main)](https://github.com/pytorch/torchtitan/actions/workflows/unit_test_gpu.yaml?query=branch%3Amain) |
 
+## RWKV-7 training
+
+Install the pinned RWKV backend in the project environment and run a training
+recipe through the standard entry point:
+
+```bash
+timeout 600s uv pip install --python .venv/bin/python -r .ci/docker/requirements-rwkv.txt
+timeout 1800s env PATH="$PWD/.venv/bin:$PATH" NGPU=1 MODULE=rwkv7 CONFIG=rwkv7_debugmodel \
+  bash run_train.sh --training.steps 10 --debug.seed 42 --debug.deterministic
+```
+
+The RWKV recipes use `RWKVTrainer`. Its first training step calls FlashRWKV2's
+public `prepare_tuning` API around the complete eager forward/backward
+computation. The step's loss and gradients feed the normal optimizer update;
+subsequent steps perform compiled warmup before CUDA Graph capture. Existing
+verified profiles are reused and only missing keys are tuned. The preparation
+report records the cache root, actual dispatch keys, selected configurations,
+and hit/tuned counts.
+
+To require previously prepared profiles, set `config.tuning_mode = "require"`
+in the Python recipe. This mode reports a missing profile as an error during
+preparation. Pretraining, full SFT, LoRA, and State Tuning use their actual
+gradient paths when preparing profiles.
+
+FlashRWKV2 defaults to `~/.cache/flashrwkv2`. Set `FLASHRWKV2_CACHE_DIR` before
+launching `run_train.sh` to select another shared root; the driver, distributed
+ranks, and child processes inherit it. `TORCH_HOME` and `XDG_CACHE_HOME` do not
+relocate verified tuning profiles. Profiles retain the upstream device class,
+shape, dtype, stride, and state-precision keys, so compatible GPUs share them
+across processes. The native extension and TileLang JIT retain their own ABI
+and compiler compatibility checks; a tuning hit can still require compilation.
+
 ## Llama 3.1 training
 
 ### Key features available
