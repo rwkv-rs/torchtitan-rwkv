@@ -56,6 +56,11 @@ def parallelize_rwkv(
             model,
             compile_config=compile_config,
             parallel_dims=parallel_dims,
+            options=(
+                {"emulate_precision_casts": True}
+                if compile_config.backend == "inductor"
+                else None
+            ),
         )
 
     if parallelism.spmd_backend == "spmd_types":

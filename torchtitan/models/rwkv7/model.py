@@ -107,7 +107,7 @@ class RWKVAttention(Module):
         v_first_BTC: torch.Tensor | None = None,
         attention_shift_BC: torch.Tensor | None = None,
         wkv_state_BHKK: torch.Tensor | None = None,
-        training_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        training_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]
         | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         flash_rwkv2 = load_flash_rwkv2(
@@ -206,11 +206,10 @@ class RWKVAttention(Module):
                 sequence_chunk_offsets_P,
                 chunk_token_starts_R,
                 chunk_token_ends_R,
+                prepared_metadata,
             ) = training_metadata
             (
                 recurrent_output_NHK,
-                _,
-                _,
                 _,
             ) = flash_rwkv2.statetune_tmix_wkv7_recurrent_fp32io16(
                 wkv_state_BHKK,
@@ -223,6 +222,7 @@ class RWKVAttention(Module):
                 value_BTC.view(-1, self.num_heads, self.head_size),
                 negative_direction_BTC.view(-1, self.num_heads, self.head_size),
                 scaled_direction_BTC.view(-1, self.num_heads, self.head_size),
+                prepared_metadata=prepared_metadata,
             )
             recurrent_output_BTC = recurrent_output_NHK.view_as(receptance_BTC)
 
@@ -314,10 +314,13 @@ class RWKVDecoderLayer(Module):
         self,
         hidden_states_BTC: torch.Tensor,
         v_first_BTC: torch.Tensor | None,
+        training_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]
+        | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         attention_output_BTC, v_first_BTC = self.linear_attn(
             self.input_layernorm(hidden_states_BTC).contiguous(),
             v_first_BTC,
+            training_metadata=training_metadata,
         )
         hidden_states_BTC = hidden_states_BTC + attention_output_BTC
         feed_forward_output_BTC = self.mlp(
@@ -461,12 +464,19 @@ class RWKVModel(BaseModel):
             decoder_layer.linear_attn.preload_provider()
             decoder_layer.mlp.preload_provider()
 
-    def forward(self, tokens_BT: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        tokens_BT: torch.Tensor,
+        training_metadata: tuple[torch.Tensor, torch.Tensor, torch.Tensor, Any]
+        | None = None,
+    ) -> torch.Tensor:
         hidden_states_BTC = self.tok_embeddings(tokens_BT)
         hidden_states_BTC = self.embedding_norm(hidden_states_BTC).contiguous()
         v_first_BTC = None
         for layer in self.layers.values():
-            hidden_states_BTC, v_first_BTC = layer(hidden_states_BTC, v_first_BTC)
+            hidden_states_BTC, v_first_BTC = layer(
+                hidden_states_BTC, v_first_BTC, training_metadata=training_metadata
+            )
         hidden_states_BTC = self.norm(hidden_states_BTC)
         hidden_states_NC = hidden_states_BTC.reshape(-1, self.config.dim)
         if self._skip_lm_head:

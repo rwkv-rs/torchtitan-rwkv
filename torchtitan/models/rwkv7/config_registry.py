@@ -24,17 +24,17 @@ from torchtitan.components.optimizer import default_adamw, LRSchedulersContainer
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
 from torchtitan.hf_datasets.text_datasets import ChatProcessor, DATASETS
-from torchtitan.trainer import Trainer
 
 from . import model_registry
 from .adapter import RWKV_LORA_TARGETS
 from .checkpoint import RWKVCheckpointManager
 from .model import RWKVModel
+from .trainer import RWKVTrainer
 
 
-def rwkv7_debugmodel() -> Trainer.Config:
+def rwkv7_debugmodel() -> RWKVTrainer.Config:
     model_spec = model_registry("debugmodel")
-    return Trainer.Config(
+    return RWKVTrainer.Config(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
                 global_vocab_size=cast(RWKVModel.Config, model_spec.model).vocab_size,
@@ -62,7 +62,7 @@ def rwkv7_debugmodel() -> Trainer.Config:
     )
 
 
-def sft_debugmodel() -> Trainer.Config:
+def sft_debugmodel() -> RWKVTrainer.Config:
     def process_sample(sample):
         return [
             {"role": "user", "content": sample["question"]},
@@ -70,7 +70,7 @@ def sft_debugmodel() -> Trainer.Config:
         ]
 
     model_spec = model_registry("debugmodel")
-    return Trainer.Config(
+    return RWKVTrainer.Config(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
                 global_vocab_size=cast(RWKVModel.Config, model_spec.model).vocab_size,
@@ -116,7 +116,7 @@ def sft_debugmodel() -> Trainer.Config:
     )
 
 
-def sft_debugmodel_lora() -> Trainer.Config:
+def sft_debugmodel_lora() -> RWKVTrainer.Config:
     config = sft_debugmodel()
     config.model_spec = model_registry(
         "debugmodel",
@@ -132,9 +132,9 @@ def sft_debugmodel_lora() -> Trainer.Config:
     return config
 
 
-def rwkv7_0_1b() -> Trainer.Config:
+def rwkv7_0_1b() -> RWKVTrainer.Config:
     model_spec = model_registry("0.1b")
-    return Trainer.Config(
+    return RWKVTrainer.Config(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
                 global_vocab_size=cast(RWKVModel.Config, model_spec.model).vocab_size,
@@ -161,42 +161,42 @@ def rwkv7_0_1b() -> Trainer.Config:
     )
 
 
-def rwkv7_0_4b() -> Trainer.Config:
+def rwkv7_0_4b() -> RWKVTrainer.Config:
     config = rwkv7_0_1b()
     config.model_spec = model_registry("0.4b")
     config.hf_assets_path = "./assets/hf/rwkv7-0.4b"
     return config
 
 
-def rwkv7_1_5b() -> Trainer.Config:
+def rwkv7_1_5b() -> RWKVTrainer.Config:
     config = rwkv7_0_1b()
     config.model_spec = model_registry("1.5b")
     config.hf_assets_path = "./assets/hf/rwkv7-1.5b"
     return config
 
 
-def rwkv7_2_9b() -> Trainer.Config:
+def rwkv7_2_9b() -> RWKVTrainer.Config:
     config = rwkv7_0_1b()
     config.model_spec = model_registry("2.9b")
     config.hf_assets_path = "./assets/hf/rwkv7-2.9b"
     return config
 
 
-def rwkv7_7_2b() -> Trainer.Config:
+def rwkv7_7_2b() -> RWKVTrainer.Config:
     config = rwkv7_0_1b()
     config.model_spec = model_registry("7.2b")
     config.hf_assets_path = "./assets/hf/rwkv7-7.2b"
     return config
 
 
-def rwkv7_13_3b() -> Trainer.Config:
+def rwkv7_13_3b() -> RWKVTrainer.Config:
     config = rwkv7_0_1b()
     config.model_spec = model_registry("13.3b")
     config.hf_assets_path = "./assets/hf/rwkv7-13.3b"
     return config
 
 
-def sft_rwkv_1_5b() -> Trainer.Config:
+def sft_rwkv_1_5b() -> RWKVTrainer.Config:
     config = sft_debugmodel()
     config.model_spec = model_registry("1.5b")
     config.hf_assets_path = "./assets/hf/rwkv7-1.5b"
@@ -205,7 +205,7 @@ def sft_rwkv_1_5b() -> Trainer.Config:
     return config
 
 
-def sft_rwkv_1_5b_lora() -> Trainer.Config:
+def sft_rwkv_1_5b_lora() -> RWKVTrainer.Config:
     config = sft_rwkv_1_5b()
     config.model_spec = model_registry(
         "1.5b",

@@ -8,6 +8,9 @@
 
 from torchtitan.components.optimizer import default_adamw
 from torchtitan.distributed.activation_checkpoint import SelectiveAC
+from torchtitan.experiments.rwkv_state_tuning.config_registry import (
+    state_tuning_debugmodel,
+)
 from torchtitan.models.deepseek_v3.config_registry import (
     deepseek_v3_debugmodel,
     deepseek_v3_debugmodel_mtp,
@@ -22,6 +25,7 @@ from torchtitan.models.qwen3.config_registry import (
     qwen3_debugmodel_moe_param_groups,
     qwen3_debugmodel_non_fused_qkv,
 )
+from torchtitan.models.rwkv7.config_registry import rwkv7_debugmodel
 from torchtitan.trainer import Trainer
 
 from . import _use_spmd_types
@@ -53,6 +57,22 @@ def llama3_debugmodel_fsdp2_tp2_cp2() -> Trainer.Config:
     config.training.num_tokens_per_microbatch_per_dp_rank = 512
     config.training.steps = 10
     config.training.disable_cuda_graphs = True
+    return config
+
+
+def rwkv7_debugmodel_fsdp2_compile() -> Trainer.Config:
+    config = rwkv7_debugmodel()
+    config.parallelism.data_parallel_shard_degree = 2
+    config.compile.enable = True
+    config.checkpoint.enable = False
+    return config
+
+
+def rwkv7_state_tuning_debugmodel_fsdp2_compile() -> Trainer.Config:
+    config = state_tuning_debugmodel()
+    config.parallelism.data_parallel_shard_degree = 2
+    config.compile.enable = True
+    config.checkpoint.enable = False
     return config
 
 

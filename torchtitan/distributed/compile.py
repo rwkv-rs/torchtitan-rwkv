@@ -7,6 +7,7 @@
 import contextlib
 import warnings
 from collections.abc import Callable
+from typing import Any
 
 import torch
 import torch._inductor.config
@@ -41,6 +42,7 @@ def apply_compile(
     *,
     compile_config: CompileConfig,
     parallel_dims: ParallelDims,
+    options: dict[str, Any] | None = None,
 ) -> None:
     """
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
@@ -67,7 +69,10 @@ def apply_compile(
 
     # pyrefly: ignore [missing-attribute]
     for layer_id, transformer_block in model.layers.named_children():
-        transformer_block.compile(backend=backend, fullgraph=True)
+        if options is None:
+            transformer_block.compile(backend=backend, fullgraph=True)
+        else:
+            transformer_block.compile(backend=backend, fullgraph=True, options=options)
 
     logger.info("Compiling each TransformerBlock with torch.compile")
 

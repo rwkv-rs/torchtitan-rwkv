@@ -156,7 +156,11 @@ def test_models_select_fake_and_real_pg_cases() -> None:
         "muse_glimmer_text_fsdp",
         "muse_glimmer_mm_fsdp+tp+sp",
     } <= fake_pg_model_tests
-    assert {"deepseek_v3_fsdp+cp+pp+ep"} <= real_pg_model_tests
+    assert {
+        "deepseek_v3_fsdp+cp+pp+ep",
+        "rwkv7_fsdp+compile",
+        "rwkv7_state_tuning_fsdp+compile",
+    } <= real_pg_model_tests
 
 
 def test_flux_fake_pg_filters_real_collective_cases() -> None:

@@ -43,6 +43,11 @@ from torchtitan.models.rwkv7 import (
 )
 from torchtitan.models.rwkv7.adapter import adapter_state_dict, RWKV_LORA_TARGETS
 from torchtitan.models.rwkv7.checkpoint import RWKVCheckpointManager
+from torchtitan.models.rwkv7.config_registry import (
+    rwkv7_debugmodel,
+    sft_debugmodel,
+    sft_debugmodel_lora,
+)
 from torchtitan.models.rwkv7.provider import (
     load_flash_rwkv2,
     PRETRAIN_ATTENTION_OPERATORS,
@@ -51,7 +56,9 @@ from torchtitan.models.rwkv7.provider import (
     STATE_TUNING_FEED_FORWARD_OPERATORS,
 )
 from torchtitan.models.rwkv7.state_dict_adapter import RWKVStateDictAdapter
+from torchtitan.models.rwkv7.trainer import RWKVTrainer
 from torchtitan.tools.utils import set_default_dtype
+from torchtitan.trainer import Trainer
 
 
 FLAVORS = {
@@ -218,6 +225,72 @@ def test_preloaded_provider_supports_fullgraph_compile():
     compiled = torch.compile(ProviderBoundary().cuda(), fullgraph=True)
     tensor = torch.ones(16, device="cuda", dtype=torch.bfloat16)
     torch.testing.assert_close(compiled(tensor), -tensor)
+
+
+@pytest.mark.parametrize("mode", ["tune", "require"])
+def test_rwkv7_preparation_keeps_first_step_loss_and_accumulated_gradients(
+    monkeypatch, mode
+):
+    from torchtitan.models.rwkv7 import trainer as rwkv7_trainer
+
+    parameter = torch.nn.Parameter(torch.tensor(3.0))
+    calls = []
+    report = {"complete": True, "counts": {"hit": 1, "missing": 0}}
+
+    def forward_backward(self, inputs, labels, global_valid_tokens, extra_kwargs):
+        loss = parameter * inputs
+        loss.backward()
+        return loss
+
+    def prepare_tuning(steps, *, mode):
+        calls.append(mode)
+        for step in steps:
+            step()
+        return report
+
+    monkeypatch.setattr(Trainer, "_forward_backward_body", forward_backward)
+    monkeypatch.setattr(
+        rwkv7_trainer,
+        "preload_flash_rwkv2",
+        lambda operators, mode: SimpleNamespace(prepare_tuning=prepare_tuning),
+    )
+    trainer = object.__new__(RWKVTrainer)
+    trainer._tuning_mode = mode
+    trainer._tuning_report = None
+    trainer._fwd_bwd_fn = lambda inputs, labels, num_tokens, kwargs: forward_backward(
+        trainer, inputs, labels, num_tokens, kwargs
+    )
+    labels = torch.tensor(0)
+    num_tokens = torch.tensor(1)
+
+    first_loss = trainer._prepare_forward_backward(
+        torch.tensor(2.0), labels, num_tokens, {}
+    )
+    assert first_loss.item() == 6.0
+    assert parameter.grad.item() == 2.0
+
+    second_loss = trainer._prepare_forward_backward(
+        torch.tensor(5.0), labels, num_tokens, {}
+    )
+    assert second_loss.item() == 15.0
+    assert parameter.grad.item() == 7.0
+    assert calls == [mode]
+    assert trainer._tuning_report is report
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    [rwkv7_debugmodel, sft_debugmodel, sft_debugmodel_lora, state_tuning_debugmodel],
+)
+def test_rwkv7_recipes_build_the_preparing_trainer(recipe):
+    config = recipe()
+    assert isinstance(config, RWKVTrainer.Config)
+    assert config._owner is RWKVTrainer
+
+
+def test_rwkv7_preparation_rejects_inspection_only_mode():
+    with pytest.raises(ValueError, match="tuning_mode"):
+        RWKVTrainer.Config(tuning_mode="inspect")
 
 
 def test_rwkv7_state_dict_mapping_covers_every_base_parameter():
